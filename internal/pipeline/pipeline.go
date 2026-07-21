@@ -459,7 +459,11 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 		}
 		pair.Release()
 		if err != nil || sso == "" {
-			log.Warnf("signup fail %s: %v sso=%v", q.Email, err, sso != "")
+			preview := text
+			if len(preview) > 180 {
+				preview = preview[:180]
+			}
+			log.Warnf("signup fail %s: err=%v sso=%v body=%q", q.Email, err, sso != "", preview)
 			e.fail.Add(1)
 			continue
 		}

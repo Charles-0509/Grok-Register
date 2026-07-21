@@ -6,8 +6,12 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -231,7 +235,8 @@ func (c *Client) VerifyEmailCode(email, code string) error {
 
 // SignupServerAction posts Next.js server action body; returns response text and SSO cookie if set.
 func (c *Client) SignupServerAction(body []byte, actionID, stateTree string) (string, string, error) {
-	req, err := http.NewRequest(http.MethodPost, SiteURL+"/sign-up", bytes.NewReader(body))
+	// POST must match scraped state tree (redirect=grok-com).
+	req, err := http.NewRequest(http.MethodPost, SignupURLGrok, bytes.NewReader(body))
 	if err != nil {
 		return "", "", err
 	}
@@ -249,22 +254,76 @@ func (c *Client) SignupServerAction(body []byte, actionID, stateTree string) (st
 	defer resp.Body.Close()
 	text, _ := readBody(resp)
 	sso := ""
-	u, _ := url.Parse(SiteURL)
-	for _, ck := range c.http.Jar.Cookies(u) {
-		if ck.Name == "sso" {
-			sso = ck.Value
-		}
-	}
-	// Also scan Set-Cookie
+	// Prefer Set-Cookie on this response (jar may hold polluted prior sso).
 	for _, sc := range resp.Cookies() {
 		if sc.Name == "sso" && sc.Value != "" {
 			sso = sc.Value
 		}
 	}
+	if sso == "" {
+		u, _ := url.Parse(SiteURL)
+		for _, ck := range c.http.Jar.Cookies(u) {
+			if ck.Name == "sso" && ck.Value != "" {
+				sso = ck.Value
+			}
+		}
+	}
+	if sso == "" {
+		if m := ExtractSSOFromText(text); m != "" {
+			sso = m
+		}
+	}
+	// Follow set-cookie hop URLs embedded in RSC flight if any.
+	if sso == "" {
+		if hop := extractSetCookieURL(text); hop != "" {
+			if v, err := c.followSSOHop(hop); err == nil && v != "" {
+				sso = v
+			}
+		}
+	}
 	if resp.StatusCode >= 400 {
-		return text, sso, fmt.Errorf("signup http=%d body=%s", resp.StatusCode, truncate(text, 120))
+		return text, sso, fmt.Errorf("signup http=%d body=%s", resp.StatusCode, truncate(text, 200))
 	}
 	return text, sso, nil
+}
+
+func (c *Client) followSSOHop(hop string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, hop, nil)
+	if err != nil {
+		return "", err
+	}
+	c.setBrowserHeaders(req)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	for _, sc := range resp.Cookies() {
+		if sc.Name == "sso" && sc.Value != "" {
+			return sc.Value, nil
+		}
+	}
+	u, _ := url.Parse(SiteURL)
+	for _, ck := range c.http.Jar.Cookies(u) {
+		if ck.Name == "sso" && ck.Value != "" {
+			return ck.Value, nil
+		}
+	}
+	return "", nil
+}
+
+var setCookieURLRe = regexp.MustCompile(`https?://[^\s"'\\]+set-cookie[^\s"'\\]*`)
+
+func extractSetCookieURL(text string) string {
+	m := setCookieURLRe.FindString(text)
+	if m == "" {
+		return ""
+	}
+	m = strings.ReplaceAll(m, `\u0026`, "&")
+	m = strings.ReplaceAll(m, `\u003d`, "=")
+	m = strings.ReplaceAll(m, `\u002F`, "/")
+	return m
 }
 
 func (c *Client) ClearAuthCookies() {
@@ -313,22 +372,60 @@ func (c *Client) clearCookieHeader() string {
 	return c.clear.CookieHeader()
 }
 
-// BuildSignupBody builds a minimal multipart-ish plain body used by Next server actions.
-// Real format is complex; we encode email/password/code/token as text fields in RSC action style.
-func BuildSignupBody(email, password, code, turnstileToken string) []byte {
-	// Common pattern: URL-encoded-ish plain fields concatenated for text/plain server actions.
-	// Keep compatible with browser path used by original project.
-	var b strings.Builder
-	// Field order approximated from observed Next actions.
-	fmt.Fprintf(&b, `["%s","%s","%s","%s"]`,
-		escapeJSON(email), escapeJSON(password), escapeJSON(code), escapeJSON(turnstileToken))
-	return []byte(b.String())
+var givenNames = []string{
+	"James", "John", "Robert", "Michael", "William", "David", "Richard", "Joseph", "Thomas", "Charles",
+}
+var familyNames = []string{
+	"Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez",
 }
 
-func escapeJSON(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	return s
+// BuildSignupBody matches grok_register/http_protocol.server_action_register lite shape.
+//
+//	[{ emailValidationCode, createUserAndSessionRequest, turnstileToken,
+//	   conversionId, castleRequestToken },
+//	 { client:"$T", meta:"$undefined", mutationKey:"$undefined" }]
+func BuildSignupBody(email, password, code, turnstileToken string) []byte {
+	given := givenNames[mrand.Intn(len(givenNames))]
+	family := familyNames[mrand.Intn(len(familyNames))]
+	payload := []any{
+		map[string]any{
+			"emailValidationCode": code,
+			"createUserAndSessionRequest": map[string]any{
+				"email":              email,
+				"givenName":          given,
+				"familyName":         family,
+				"clearTextPassword":  password,
+				"tosAcceptedVersion": "$undefined",
+			},
+			"turnstileToken":     turnstileToken,
+			"conversionId":       randomUUID(),
+			"castleRequestToken": "",
+		},
+		map[string]any{
+			"client":      "$T",
+			"meta":        "$undefined",
+			"mutationKey": "$undefined",
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return []byte("[]")
+	}
+	return raw
+}
+
+func randomUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%s-%s-%s-%s-%s",
+		hex.EncodeToString(b[0:4]),
+		hex.EncodeToString(b[4:6]),
+		hex.EncodeToString(b[6:8]),
+		hex.EncodeToString(b[8:10]),
+		hex.EncodeToString(b[10:16]),
+	)
 }
 
 func pbStr(field int, s string) []byte {
