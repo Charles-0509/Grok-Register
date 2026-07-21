@@ -1,0 +1,60 @@
+# Windows / Docker Desktop 一键起栈。
+#
+# 用法：
+#   docker compose up -d                      # 起全部（WARP + Privoxy + FlareSolverr + grok(idle)）
+#   docker compose ps
+#   docker exec -it grok-reg grok help
+#   docker exec -it grok-reg grok start -t 10  # 后台跑；PID 文件、日志都在 ./data 下
+#   docker exec -it grok-reg grok status
+#   docker exec -it grok-reg grok logs -f
+#   docker exec -it grok-reg grok stop
+#
+# 一次性前台跑一批（跑完即停、不保留）：
+#   docker compose run --rm grok run
+#   # 或指定目标数：
+#   docker compose run --rm -e GROK_TARGET=20 grok run
+#
+# 数据卷挂载到宿主机 `./data` → Windows 文件资源管理器可直接看 SSO/CPA 输出。
+#
+# 端口（仅在 host 上访问；grok 容器内访问走内网服务名）：
+#   127.0.0.1:40000  → WARP SOCKS5
+#   127.0.0.1:40080  → Privoxy HTTP (host egress)
+#   127.0.0.1:8191   → FlareSolverr
+#
+# 注意：`include:` 需要 Docker Compose v2.20+（Docker Desktop 4.22+ 自带），通常无需手动装。
+# 老版本可改用 `docker compose -f clearance/docker-compose.yml -f docker-compose.yml up -d`。
+
+include:
+  - path: clearance/docker-compose.yml
+
+services:
+  grok:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: grok-reg:local
+    container_name: grok-reg
+    restart: unless-stopped
+    depends_on:
+      privoxy:
+        condition: service_healthy
+      flaresolverr:
+        condition: service_healthy
+    environment:
+      GROK_HOME: /data
+      GROK_PYTHON: /opt/cloakbrowser-venv/bin/python
+      GROK_TURNSTILE_SCRIPT: /usr/local/share/grok-reg/turnstile_mint.py
+      CLOAKBROWSER_SUPPRESS_FONT_WARNING: "1"
+      # 默认 idle 模式：容器长跑，配合 docker exec 用
+      MODE: idle
+    volumes:
+      # 持久化 grok 输出（SSO/CPA/日志），Windows 上能直接看
+      - ./data:/data
+      # 默认配置模板（entrypoint 在 ~/.grok/config.env 缺失时会拷一份过去）
+      - ./docker/grok-config.env:/etc/grok/config.env:ro
+    # 不映射端口：grok 不监听任何端口；注册流量从容器内发起即可。
+    networks:
+      default: {}
+
+# include 引入的 clearance 服务名是 warp-proxy / privoxy / flaresolverr；
+# grok 内部 config 用 http://privoxy:8118 / http://flaresolverr:8191。
