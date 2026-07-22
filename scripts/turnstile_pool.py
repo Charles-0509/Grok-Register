@@ -59,10 +59,27 @@ def emit(obj: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+def launch_args(mode: str) -> list[str]:
+    args = [
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-infobars",
+        "--disable-dev-shm-usage",
+    ]
+    if mode in ("", "auto", "offscreen"):
+        args.extend(["--window-position=-32000,-32000", "--window-size=800,600"])
+    return args
+
+
 class Slot:
-    def __init__(self, chrome: str, proxy: str) -> None:
+    def __init__(self, chrome: str, proxy: str, mode: str = "offscreen") -> None:
         self.chrome = chrome
         self.proxy = proxy
+        self.mode = (mode or "offscreen").strip().lower() or "offscreen"
+        if self.mode == "auto":
+            self.mode = "offscreen"
         self.browser = None
         self.pw = None
         self.lock = asyncio.Lock()
@@ -73,17 +90,11 @@ class Slot:
             return
         from playwright.async_api import async_playwright
 
+        use_headless = self.mode == "headless"
         launch: dict = {
             "executable_path": self.chrome,
-            "headless": True,
-            "args": [
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-infobars",
-                "--disable-dev-shm-usage",
-            ],
+            "headless": use_headless,
+            "args": launch_args(self.mode),
         }
         if self.proxy:
             launch["proxy"] = {"server": self.proxy}
@@ -241,8 +252,8 @@ async def mint_on_slot(
 
 
 class Pool:
-    def __init__(self, size: int, chrome: str, proxy: str) -> None:
-        self.slots = [Slot(chrome, proxy) for _ in range(max(1, size))]
+    def __init__(self, size: int, chrome: str, proxy: str, mode: str = "offscreen") -> None:
+        self.slots = [Slot(chrome, proxy, mode=mode) for _ in range(max(1, size))]
         self.queue: asyncio.Queue[Slot] = asyncio.Queue()
         for s in self.slots:
             self.queue.put_nowait(s)
@@ -282,8 +293,8 @@ class Pool:
         await asyncio.gather(*(s.close() for s in self.slots))
 
 
-async def run_pool(size: int, chrome: str, proxy: str) -> None:
-    pool = Pool(size, chrome, proxy)
+async def run_pool(size: int, chrome: str, proxy: str, mode: str = "offscreen") -> None:
+    pool = Pool(size, chrome, proxy, mode=mode)
     try:
         await pool.warm()
         emit({"ok": True, "event": "ready", "workers": size, "chrome": chrome})
@@ -331,14 +342,21 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--proxy", default="")
     ap.add_argument("--chrome", default="")
+    ap.add_argument(
+        "--mode",
+        default="offscreen",
+        choices=("offscreen", "headless", "auto"),
+        help="offscreen=headed off-display (default); headless=true headless",
+    )
     args = ap.parse_args()
     chrome = args.chrome.strip() or find_chrome()
     if not chrome:
         emit({"ok": False, "error": "chrome not found"})
         return 1
     proxy = args.proxy.strip() or (os.environ.get("REGISTER_PROXY") or "").strip()
+    mode = (args.mode or "offscreen").strip().lower()
     try:
-        asyncio.run(run_pool(max(1, args.workers), chrome, proxy))
+        asyncio.run(run_pool(max(1, args.workers), chrome, proxy, mode=mode))
     except SystemExit:
         return 0
     except Exception as exc:

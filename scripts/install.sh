@@ -525,6 +525,18 @@ apply_network_to_config() {
   else
     env_set_key "$dest" "CLEARANCE_AUTO_STOP" "0"
   fi
+  # 协议优先 + TLS 指纹；WARP 仅作 auto 回退
+  case "$NET_MODE" in
+    warp)
+      env_set_key "$dest" "CLEARANCE_MODE" "auto"
+      ;;
+    proxy|none)
+      env_set_key "$dest" "CLEARANCE_MODE" "never"
+      ;;
+  esac
+  env_set_key "$dest" "CF_IMPERSONATE" "chrome_131"
+  env_set_key "$dest" "CF_IMPERSONATE_FALLBACK" "chrome_124,chrome_120"
+  env_set_key "$dest" "TURNSTILE_MODE" "offscreen"
   if [ -n "${INSTALL_DIR:-}" ] && [ -d "$INSTALL_DIR/clearance" ]; then
     env_set_key "$dest" "CLEARANCE_COMPOSE_DIR" "$INSTALL_DIR/clearance"
   fi

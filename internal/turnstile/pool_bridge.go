@@ -25,6 +25,8 @@ type PoolBridge struct {
 	Clear      *clearance.Manager
 	Workers    int
 	Timeout    time.Duration
+	// Mode: offscreen (default) | headless
+	Mode string
 
 	mu      sync.Mutex
 	cmd     *exec.Cmd
@@ -59,6 +61,7 @@ func NewPoolBridge(proxy string, cm *clearance.Manager, workers int) *PoolBridge
 		Clear:      cm,
 		Workers:    workers,
 		Timeout:    100 * time.Second,
+		Mode:       "offscreen",
 		waiters:    map[int64]chan poolResp{},
 	}
 }
@@ -103,6 +106,11 @@ func (p *PoolBridge) start(ctx context.Context) error {
 	if chrome := strings.TrimSpace(os.Getenv("CHROME_PATH")); chrome != "" {
 		args = append(args, "--chrome", chrome)
 	}
+	mode := strings.ToLower(strings.TrimSpace(p.Mode))
+	if mode == "" || mode == "auto" {
+		mode = "offscreen"
+	}
+	args = append(args, "--mode", mode)
 	cmd := exec.Command(p.Python, args...)
 	cmd.Env = os.Environ()
 	stdin, err := cmd.StdinPipe()

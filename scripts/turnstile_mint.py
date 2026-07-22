@@ -76,6 +76,26 @@ def parse_cookie_header(raw: str) -> list[dict]:
     return out
 
 
+def launch_args(mode: str) -> list[str]:
+    args = [
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-infobars",
+        "--disable-dev-shm-usage",
+    ]
+    # offscreen: headed browser moved off-screen (true headless often gets Turnstile 600010)
+    if mode in ("", "auto", "offscreen"):
+        args.extend(
+            [
+                "--window-position=-32000,-32000",
+                "--window-size=800,600",
+            ]
+        )
+    return args
+
+
 async def mint(
     site_key: str,
     page_url: str,
@@ -84,21 +104,19 @@ async def mint(
     cookies: list[dict],
     timeout: float,
     ua: str,
+    mode: str = "offscreen",
 ) -> str:
     from playwright.async_api import async_playwright
 
-    # Match grok_register/register.py _launch_options()
+    mode = (mode or "offscreen").strip().lower()
+    if mode in ("", "auto"):
+        mode = "offscreen"
+    use_headless = mode == "headless"
+
     launch: dict = {
         "executable_path": chrome,
-        "headless": True,
-        "args": [
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-infobars",
-            "--disable-dev-shm-usage",
-        ],
+        "headless": use_headless,
+        "args": launch_args(mode),
     }
     if proxy:
         # Playwright accepts {"server": "http://..."}
@@ -269,6 +287,12 @@ def main() -> int:
     ap.add_argument("--cookie", default="")
     ap.add_argument("--ua", default="")
     ap.add_argument("--timeout", type=float, default=90)
+    ap.add_argument(
+        "--mode",
+        default="offscreen",
+        choices=("offscreen", "headless", "auto"),
+        help="offscreen=headed off-display (default); headless=true headless (often blocked)",
+    )
     args = ap.parse_args()
 
     chrome = args.chrome.strip() or find_chrome()
@@ -286,6 +310,7 @@ def main() -> int:
                 cookies=cookies,
                 timeout=args.timeout,
                 ua=args.ua.strip(),
+                mode=args.mode,
             )
         )
     except Exception as exc:

@@ -20,12 +20,28 @@ grok upload                # 手动上传 CPA JSON 到 Management API
 
 | 特性 | 说明 |
 |------|------|
-| **testmail** | `EMAIL_MODE=testmail`，GitHub Student Pack 等；`TESTMAIL_API_KEY` / `NAMESPACE` / `DOMAIN` |
-| **Turnstile 常驻池** | 默认 `turnstile_pool.py` 多浏览器复用 → 回退 one-shot mint → chromedp |
-| **全局座位上限** | `done + reserved ≤ target`，避免多线程超开邮箱/注册 |
-| **交互 `start` / `config`** | 数量与线程**不写** `config.env`；`grok config` 打开配置并刷新 example |
-| **CPA 宿主机路径** | `CPA_MANAGEMENT_BASE=http://127.0.0.1:8317/v0/management`；自动改写 docker 主机名 |
-| **一键安装** | `scripts/install.sh`：可改命令名、安装目录、数据目录 |
+| **协议优先 + TLS 指纹** | Go `tls-client`（默认 `chrome_131`）过 CF；`CLEARANCE_MODE=auto` 失败再拉 WARP/FS |
+| **Turnstile 屏外有头** | 默认 `TURNSTILE_MODE=offscreen`（非真 headless，降低 600010） |
+| **Castle 空 token** | 当前 `castleRequestToken=""`；风控收紧后再补 offline |
+| **testmail** | `EMAIL_MODE=testmail`，GitHub Student Pack 等 |
+| **全局座位上限** | `done + reserved ≤ target` |
+| **CPA 上传 wait** | 结束前等待 Management 上传，避免进程先退出 |
+| **一键安装** | 路径/命令名/WARP/结束停容器交互 |
+
+### 架构三腿
+
+```text
+协议腿  gRPC 发/验码 → Server Action → SSO hop → OAuth → 探活/CPA
+边缘腿  chrome_131 TLS 优先 → CF 拦再 clearance（auto）
+挑战腿  Turnstile 仅 Chromium（offscreen 池 / one-shot）
+```
+
+冒烟（不注册账号）:
+
+```bash
+go run scripts/smoke_protocol.go
+REGISTER_PROXY=http://127.0.0.1:7890 go run scripts/smoke_protocol.go
+```
 
 ---
 
@@ -466,13 +482,34 @@ make build && sudo make install
 
 ---
 
+## 边缘 / 清障
+
+```env
+CF_IMPERSONATE=chrome_131
+CF_IMPERSONATE_FALLBACK=chrome_124,chrome_120
+CLEARANCE_MODE=auto    # auto | always | never
+CLEARANCE_ENABLED=1
+CLEARANCE_AUTO_STOP=1
+```
+
+| CLEARANCE_MODE | 行为 |
+|----------------|------|
+| **auto**（默认） | 先 TLS 指纹 warm；403/拦再 `docker compose up` + 预热 |
+| **always** | 启动即清障 |
+| **never** | 不碰 Docker 清障（靠直连/自有代理） |
+
 ## Turnstile
 
-默认 `browser`：
+默认 `browser` + **`TURNSTILE_MODE=offscreen`**：
 
-1. 常驻池 `turnstile_pool.py`（`TURNSTILE_WORKERS`，约 2）  
+1. 常驻池 `turnstile_pool.py`（屏外有头）  
 2. 回退 one-shot `turnstile_mint.py`  
-3. 再回退 chromedp  
+3. 再回退 chromedp 真 headless（不推荐，易 600010）  
+
+```env
+TURNSTILE_PROVIDER=browser
+TURNSTILE_MODE=offscreen   # offscreen | headless | auto
+```
 
 默认**不**注入 FlareSolverr cookie/UA（除非 `GROK_TURNSTILE_INJECT_CLEARANCE=1`）。
 

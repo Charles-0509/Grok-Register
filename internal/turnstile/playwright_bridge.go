@@ -23,6 +23,8 @@ type PlaywrightBridge struct {
 	Proxy      string
 	Clear      *clearance.Manager
 	Timeout    time.Duration
+	// Mode: offscreen (default) | headless
+	Mode string
 
 	// serialize mint — original holds Physical_Sem for one solve
 	mu sync.Mutex
@@ -35,6 +37,7 @@ func NewPlaywrightBridge(proxy string, cm *clearance.Manager) *PlaywrightBridge 
 		Proxy:      proxy,
 		Clear:      cm,
 		Timeout:    100 * time.Second,
+		Mode:       "offscreen",
 	}
 }
 
@@ -86,6 +89,11 @@ func (p *PlaywrightBridge) Solve(ctx context.Context, siteKey, pageURL string) (
 	if chrome := strings.TrimSpace(os.Getenv("CHROME_PATH")); chrome != "" {
 		args = append(args, "--chrome", chrome)
 	}
+	mode := strings.ToLower(strings.TrimSpace(p.Mode))
+	if mode == "" || mode == "auto" {
+		mode = "offscreen"
+	}
+	args = append(args, "--mode", mode)
 
 	cmd := exec.CommandContext(ctx, p.Python, args...)
 	// inherit solver knobs

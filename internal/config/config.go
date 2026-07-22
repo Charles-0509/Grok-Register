@@ -32,8 +32,12 @@ type Config struct {
 	TestmailDomain    string // default inbox.testmail.app
 
 	ClearanceEnabled bool
+	// ClearanceMode: auto | always | never
+	// auto = protocol TLS first; start stack only on CF block
+	// always = EnsureStack when ClearanceEnabled
+	// never = never touch docker clearance
+	ClearanceMode string
 	// ClearanceAutoStop: after run ends or is interrupted, docker compose stop clearance stack.
-	// Start always tries EnsureStack when ClearanceEnabled (auto-start is not optional).
 	ClearanceAutoStop bool
 	// ClearanceComposeDir optional override (else GROK_CLEARANCE_DIR / discover).
 	ClearanceComposeDir string
@@ -42,11 +46,16 @@ type Config struct {
 	ClearanceProxy      string
 	ClearanceURLs       string
 
+	// CF TLS impersonation (bogdanfinn/tls-client profiles)
+	CFImpersonate         string // chrome_131
+	CFImpersonateFallback string // comma-separated
+
 	// Target / TurnstileWorkers are RUNTIME-ONLY (CLI or interactive start).
 	// Not loaded from or saved to config.env.
-	Target           int
-	PhysicalCap      int
+	Target            int
+	PhysicalCap       int
 	TurnstileProvider string
+	TurnstileMode     string // offscreen | headless | auto
 	LiteSolverURL     string
 	TurnstileWorkers  int // 1-8 concurrent register/mint threads; set by start
 
@@ -81,14 +90,18 @@ func Defaults() Config {
 		EmailAPI:              "http://127.0.0.1:8080",
 		TestmailDomain:        "inbox.testmail.app",
 		ClearanceEnabled:      true,
+		ClearanceMode:         "auto",
 		ClearanceAutoStop:     true,
 		RegisterProxy:         "http://127.0.0.1:40080",
 		FlareSolverrURL:       "http://127.0.0.1:8191",
 		ClearanceProxy:        "http://privoxy:8118",
 		ClearanceURLs:         "https://accounts.x.ai,https://x.ai,https://status.x.ai,https://console.x.ai,https://auth.x.ai",
+		CFImpersonate:         "chrome_131",
+		CFImpersonateFallback: "chrome_124,chrome_120",
 		Target:                0, // set by start CLI/prompt
 		PhysicalCap:           0,
 		TurnstileProvider:     "browser",
+		TurnstileMode:         "offscreen",
 		LiteSolverURL:         "http://127.0.0.1:5072",
 		TurnstileWorkers:      0, // set by start CLI/prompt
 		ProtocolHTTP:          true,
@@ -194,15 +207,27 @@ func Save(path string, cfg Config) error {
 		b.WriteString(fmt.Sprintf("TESTMAIL_DOMAIN=%s\n", cfg.TestmailDomain))
 	}
 	b.WriteString(fmt.Sprintf("CLEARANCE_ENABLED=%s\n", bool01(cfg.ClearanceEnabled)))
+	if cfg.ClearanceMode != "" {
+		b.WriteString(fmt.Sprintf("CLEARANCE_MODE=%s\n", cfg.ClearanceMode))
+	}
 	b.WriteString(fmt.Sprintf("CLEARANCE_AUTO_STOP=%s\n", bool01(cfg.ClearanceAutoStop)))
 	if cfg.ClearanceComposeDir != "" {
 		b.WriteString(fmt.Sprintf("CLEARANCE_COMPOSE_DIR=%s\n", cfg.ClearanceComposeDir))
+	}
+	if cfg.CFImpersonate != "" {
+		b.WriteString(fmt.Sprintf("CF_IMPERSONATE=%s\n", cfg.CFImpersonate))
+	}
+	if cfg.CFImpersonateFallback != "" {
+		b.WriteString(fmt.Sprintf("CF_IMPERSONATE_FALLBACK=%s\n", cfg.CFImpersonateFallback))
 	}
 	b.WriteString(fmt.Sprintf("REGISTER_PROXY=%s\n", cfg.RegisterProxy))
 	b.WriteString(fmt.Sprintf("FLARESOLVERR_URL=%s\n", cfg.FlareSolverrURL))
 	b.WriteString(fmt.Sprintf("CLEARANCE_PROXY=%s\n", cfg.ClearanceProxy))
 	b.WriteString(fmt.Sprintf("CLEARANCE_URLS=%s\n", cfg.ClearanceURLs))
 	b.WriteString(fmt.Sprintf("TURNSTILE_PROVIDER=%s\n", cfg.TurnstileProvider))
+	if cfg.TurnstileMode != "" {
+		b.WriteString(fmt.Sprintf("TURNSTILE_MODE=%s\n", cfg.TurnstileMode))
+	}
 	if cfg.LiteSolverURL != "" {
 		b.WriteString(fmt.Sprintf("LITE_SOLVER_URL=%s\n", cfg.LiteSolverURL))
 	}
@@ -371,11 +396,20 @@ func applyMap(cfg *Config, env map[string]string) {
 	if v, ok := env["CLEARANCE_ENABLED"]; ok {
 		cfg.ClearanceEnabled = truthy(v)
 	}
+	if v, ok := env["CLEARANCE_MODE"]; ok {
+		cfg.ClearanceMode = strings.ToLower(strings.TrimSpace(v))
+	}
 	if v, ok := env["CLEARANCE_AUTO_STOP"]; ok {
 		cfg.ClearanceAutoStop = truthy(v)
 	}
 	if v, ok := env["CLEARANCE_COMPOSE_DIR"]; ok {
 		cfg.ClearanceComposeDir = strings.TrimSpace(v)
+	}
+	if v, ok := env["CF_IMPERSONATE"]; ok {
+		cfg.CFImpersonate = strings.TrimSpace(v)
+	}
+	if v, ok := env["CF_IMPERSONATE_FALLBACK"]; ok {
+		cfg.CFImpersonateFallback = strings.TrimSpace(v)
 	}
 	if v, ok := env["REGISTER_PROXY"]; ok {
 		cfg.RegisterProxy = v
@@ -391,6 +425,9 @@ func applyMap(cfg *Config, env map[string]string) {
 	}
 	if v, ok := env["TURNSTILE_PROVIDER"]; ok {
 		cfg.TurnstileProvider = v
+	}
+	if v, ok := env["TURNSTILE_MODE"]; ok {
+		cfg.TurnstileMode = strings.ToLower(strings.TrimSpace(v))
 	}
 	if v, ok := env["LITE_SOLVER_URL"]; ok {
 		cfg.LiteSolverURL = v

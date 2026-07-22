@@ -179,41 +179,77 @@ func (e *Engine) run(ctx context.Context) error {
 		s.Error = ""
 	})
 
-	// Clearance stack: ensure docker compose up, optional stop on exit
-	if cfg.ClearanceEnabled {
+	// Clearance mode: auto (protocol first) | always | never
+	clearMode := strings.ToLower(strings.TrimSpace(cfg.ClearanceMode))
+	if clearMode == "" {
+		clearMode = "auto"
+	}
+	if !cfg.ClearanceEnabled {
+		clearMode = "never"
+	}
+	stackStarted := false
+	stopStack := func() {
+		if !stackStarted || !cfg.ClearanceAutoStop {
+			return
+		}
+		sm, serr := clearance.StopStack(cfg.ClearanceComposeDir)
+		if serr != nil {
+			log.Warnf("[clearance] 自动停止失败: %v", serr)
+		} else {
+			log.Infof("[clearance] %s", sm)
+		}
+	}
+	defer stopStack()
+
+	ensureClearance := func(reason string) {
+		if clearMode == "never" {
+			return
+		}
+		log.Infof("[clearance] 拉起清障栈 (%s)…", reason)
 		msg, err := clearance.EnsureStack(cfg.ClearanceComposeDir, 40080, 8191)
 		if err != nil {
-			log.Warnf("[clearance] 自动拉起失败: %v — 将继续尝试预热", err)
-		} else {
-			log.Infof("[clearance] %s", msg)
+			log.Warnf("[clearance] 自动拉起失败: %v", err)
+			return
 		}
-		if cfg.ClearanceAutoStop {
-			log.Info("[clearance] CLEARANCE_AUTO_STOP=1：运行结束/中断后将停止清障容器")
-			defer func() {
-				sm, serr := clearance.StopStack(cfg.ClearanceComposeDir)
-				if serr != nil {
-					log.Warnf("[clearance] 自动停止失败: %v", serr)
-				} else {
-					log.Infof("[clearance] %s", sm)
-				}
-			}()
-		}
+		stackStarted = true
+		log.Infof("[clearance] %s", msg)
 		e.cm = clearance.NewManager(cfg.FlareSolverrURL, cfg.ClearanceProxy, cfg.ClearanceURLs)
-		msg, err = e.cm.Prewarm()
-		if err != nil {
-			log.Warnf("clearance: %v (%s)", err, msg)
+		if msg2, err2 := e.cm.Prewarm(); err2 != nil {
+			log.Warnf("[clearance] 预热: %v (%s)", err2, msg2)
 		} else {
-			log.Infof("[clearance] %s", msg)
+			log.Infof("[clearance] %s", msg2)
 		}
-	} else {
-		log.Info("[clearance] 未启用")
+	}
+
+	switch clearMode {
+	case "always":
+		log.Info("[clearance] CLEARANCE_MODE=always")
+		ensureClearance("always")
+	case "never":
+		log.Info("[clearance] CLEARANCE_MODE=never（协议 TLS 直连/代理，无 Docker 清障）")
+	default:
+		log.Info("[clearance] CLEARANCE_MODE=auto（协议优先，CF 拦截时再拉清障）")
+	}
+	if cfg.ClearanceAutoStop && clearMode != "never" {
+		log.Info("[clearance] CLEARANCE_AUTO_STOP=1：本 run 若拉起栈，结束时将 stop")
 	}
 
 	var err error
-	e.xai, err = protocol.NewClient(cfg.RegisterProxy, e.cm)
+	imp := cfg.CFImpersonate
+	if imp == "" {
+		imp = "chrome_131"
+	}
+	e.xai, err = protocol.NewClientOpts(protocol.ClientOptions{
+		Proxy:               cfg.RegisterProxy,
+		Clearance:           e.cm,
+		Impersonate:         imp,
+		ImpersonateFallback: protocol.FallbackProfiles(cfg.CFImpersonateFallback),
+	})
 	if err != nil {
 		return err
 	}
+	log.Infof("[cf] TLS impersonate=%s fallback=%s proxy=%v", e.xai.Profile(), cfg.CFImpersonateFallback, cfg.RegisterProxy != "")
+
 	e.mail = email.New(email.Config{
 		Mode:              cfg.EmailMode,
 		Domain:            cfg.EmailDomain,
@@ -229,17 +265,22 @@ func (e *Engine) run(ctx context.Context) error {
 	} else {
 		log.Infof("Email mode=%s", cfg.EmailMode)
 	}
+	tsMode := cfg.TurnstileMode
+	if tsMode == "" {
+		tsMode = "offscreen"
+	}
 	e.turn = turnstile.New(turnstile.Options{
 		Provider: cfg.TurnstileProvider,
 		LiteURL:  cfg.LiteSolverURL,
 		Proxy:    cfg.RegisterProxy,
 		Clear:    e.cm,
 		Workers:  sWorkers, // parallel S = pool slots
+		Mode:     tsMode,
 	})
 	if c, ok := e.turn.(turnstile.Closer); ok {
 		defer c.Close()
 	}
-	log.Infof("Turnstile provider=%s workers=%d (pool → one-shot mint → chromedp)", e.turn.Name(), sWorkers)
+	log.Infof("Turnstile provider=%s mode=%s workers=%d (pool → one-shot → chromedp)", e.turn.Name(), tsMode, sWorkers)
 	log.Infof("Turnstile mint: python=%s pool=%s script=%s", turnstile.DetectedPython(), turnstile.DetectedPoolScript(), turnstile.DetectedScript())
 	e.uploader = cpa.NewUploader(cpa.UploadConfig{
 		Enabled:      cfg.CPAUploadEnabled,
@@ -265,8 +306,44 @@ func (e *Engine) run(ctx context.Context) error {
 		s.Phase = state.PhaseRegister
 		s.PhaseDetail = "获取注册配置"
 	})
-	log.Info("Fetching signup config...")
+	log.Info("Fetching signup config (protocol warm)…")
 	scfg, err := e.xai.FetchConfig()
+	if err != nil {
+		// Protocol-first: CF block → try profile fallbacks, then clearance auto
+		code := protocol.CodeOf(err)
+		log.Warnf("[cf] warm failed code=%s err=%v", code, err)
+		tried := map[string]struct{}{e.xai.Profile(): {}}
+		for _, fb := range protocol.FallbackProfiles(cfg.CFImpersonateFallback) {
+			if _, ok := tried[fb]; ok {
+				continue
+			}
+			tried[fb] = struct{}{}
+			log.Infof("[cf] try impersonate fallback=%s", fb)
+			if rerr := e.xai.RecreateWithProfile(fb); rerr != nil {
+				log.Warnf("[cf] recreate %s: %v", fb, rerr)
+				continue
+			}
+			scfg, err = e.xai.FetchConfig()
+			if err == nil {
+				log.Infof("[cf] warm ok profile=%s", e.xai.Profile())
+				break
+			}
+			log.Warnf("[cf] fallback %s failed: %v", fb, err)
+		}
+		if err != nil && clearMode == "auto" {
+			ensureClearance("cf_blocked")
+			// rebuild client with clearance cookies
+			e.xai, err = protocol.NewClientOpts(protocol.ClientOptions{
+				Proxy:       cfg.RegisterProxy,
+				Clearance:   e.cm,
+				Impersonate: e.xai.Profile(),
+			})
+			if err != nil {
+				return err
+			}
+			scfg, err = e.xai.FetchConfig()
+		}
+	}
 	if err != nil {
 		_ = st.Set(func(s *state.Snapshot) {
 			s.Status = state.StatusError
@@ -275,8 +352,8 @@ func (e *Engine) run(ctx context.Context) error {
 		})
 		return fmt.Errorf("config fetch: %w", err)
 	}
-	log.Infof("SITE_KEY=%s ACTION_ID=%s...", scfg.SiteKey, trim(scfg.ActionID, 12))
-	log.OKf("注册服务已启动 | 目标 %d | run=%s", e.opt.Target, e.opt.Run.RunID)
+	log.Infof("SITE_KEY=%s ACTION_ID=%s… source=%s profile=%s", scfg.SiteKey, trim(scfg.ActionID, 12), scfg.Source, e.xai.Profile())
+	log.OKf("注册服务已启动 | 目标 %d | run=%s | impersonate=%s", e.opt.Target, e.opt.Run.RunID, e.xai.Profile())
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -595,11 +672,15 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 
 		e.xai.ClearAuthCookies()
 		if err := e.xai.VerifyEmailCode(q.Email, q.Code); err != nil {
-			log.Warnf("verify fail %s: %v", q.Email, err)
+			log.Warnf("verify fail %s code=%s: %v", q.Email, protocol.CodeOf(err), err)
 			pair.Release()
 			e.fail.Add(1)
 			e.releaseReserve()
 			continue
+		}
+		// Optional ValidatePassword (document field 4/5); non-fatal
+		if err := e.xai.ValidatePassword(q.Email, q.Password); err != nil {
+			log.Debugf("validate_password skip/fail %s: %v", q.Email, err)
 		}
 		body := protocol.BuildSignupBody(q.Email, q.Password, q.Code, token)
 		text, sso, err := e.xai.SignupServerAction(body, scfg.ActionID, scfg.StateTree)
@@ -612,7 +693,7 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 			if len(preview) > 180 {
 				preview = preview[:180]
 			}
-			log.Warnf("signup fail %s: err=%v sso=%v body=%q", q.Email, err, sso != "", preview)
+			log.Warnf("signup fail %s code=%s err=%v sso=%v body=%q", q.Email, protocol.CodeOf(err), err, sso != "", preview)
 			e.fail.Add(1)
 			e.releaseReserve() // free seat for another attempt
 			continue

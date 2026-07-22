@@ -109,6 +109,8 @@ type Options struct {
 	Clear    *clearance.Manager
 	// Workers: parallel persistent CloakBrowser slots (browser pool). 0 = auto (2).
 	Workers int
+	// Mode: offscreen (default) | headless | auto
+	Mode string
 }
 
 // chain tries primary then fallback.
@@ -173,8 +175,14 @@ func New(opts Options) Provider {
 		if workers <= 0 {
 			workers = 2
 		}
+		mode := strings.ToLower(strings.TrimSpace(opts.Mode))
+		if mode == "" || mode == "auto" {
+			mode = "offscreen"
+		}
 		pool := NewPoolBridge(opts.Proxy, opts.Clear, workers)
+		pool.Mode = mode
 		pw := NewPlaywrightBridge(opts.Proxy, opts.Clear)
+		pw.Mode = mode
 		var list []Provider
 		if pool.Available() {
 			list = append(list, pool)
@@ -182,12 +190,15 @@ func New(opts Options) Provider {
 		if pw.ScriptPath != "" && pw.Python != "" {
 			list = append(list, pw)
 		}
+		// chromedp true-headless is last resort (often Turnstile 600010)
 		list = append(list, NewBrowser(opts.Proxy, opts.Clear))
 		if len(list) == 1 {
 			return list[0]
 		}
 		return &chain{name: "browser", list: list}
 	default:
-		return NewPlaywrightBridge(opts.Proxy, opts.Clear)
+		pw := NewPlaywrightBridge(opts.Proxy, opts.Clear)
+		pw.Mode = opts.Mode
+		return pw
 	}
 }
