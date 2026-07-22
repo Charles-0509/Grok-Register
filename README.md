@@ -246,15 +246,20 @@ export PATH=$PATH:/usr/local/go/bin
 export GROK_PYTHON=/opt/cloakbrowser-venv/bin/python
 export CLOAKBROWSER_SUPPRESS_FONT_WARNING=1
 
-# 后台跑；目标 N = 探活成功写入 CPA/ 的数量
-grok start -t 10
+# 交互：询问注册数量 + 并发线程(1-8)
+grok start
+
+# 或一次性指定（数量与线程不再写进 config.env）
+grok start -t 10 --thread 3
+
 grok status
 grok logs -f
 grok stop
-
-# 手动上传最近 run 的 CPA JSON 到 Management API
-grok upload
+grok config    # 打开 ~/.grok/config.env，并刷新 config.env.example
+grok upload    # 手动上传 CPA JSON
 ```
+
+升级后请查看 **`~/.grok/config.env.example`**（每次 start/config 自动同步）了解新增配置占位符。
 
 **数据目录**（`GROK_HOME` 可覆盖，默认 `~/.grok`，root 为 `/root/.grok`）：
 
@@ -294,12 +299,13 @@ sudo /opt/cloakbrowser-venv/bin/pip install -r scripts/requirements-turnstile.tx
 
 | 命令 | 说明 |
 |------|------|
-| `grok start` | 后台启动，默认目标 10 |
-| `grok start -t N` | 目标 N（1–10000）；**计数 = 探活成功写入 CPA 的数量** |
+| `grok start` | 交互询问：注册数量 + 并发线程(1–8) |
+| `grok start -t N --thread M` | 目标 N（1–10000）；线程 M（1–8）；**计数 = CPA 探活成功数** |
 | `grok status` | 未运行 / 运行中 / 错误；进度、线程、当前步骤 |
 | `grok logs` | 最近一次完整日志 |
 | `grok logs -f` | 实时跟踪日志 |
 | `grok stop` | 立即停止 |
+| `grok config` | 打开 `~/.grok/config.env`，并刷新 `config.env.example` |
 | `grok upload` | 交互选择最近 10 次 run，上传其中 CPA JSON |
 
 ---
@@ -313,10 +319,12 @@ sudo /opt/cloakbrowser-venv/bin/pip install -r scripts/requirements-turnstile.tx
 | 变量 | 说明 |
 |------|------|
 | `GROK_HOME` | 数据根目录，默认 `~/.grok` |
-| `GROK_PYTHON` | 跑 `turnstile_mint.py` 的 Python |
-| `GROK_TURNSTILE_SCRIPT` | mint 脚本路径 |
+| `GROK_PYTHON` | 跑 `turnstile_mint.py` / `turnstile_pool.py` 的 Python |
+| `GROK_TURNSTILE_SCRIPT` | one-shot mint 脚本路径 |
+| `GROK_TURNSTILE_POOL_SCRIPT` | 常驻池脚本路径 |
 | `CHROME_PATH` | 强制指定 Chromium 可执行文件 |
 | `CLOAKBROWSER_SUPPRESS_FONT_WARNING` | 抑制 Linux 字体提示（可选） |
+| `EDITOR` | `grok config` 使用的编辑器（默认尝试 nano/vim） |
 
 ---
 
@@ -343,9 +351,13 @@ sudo /opt/cloakbrowser-venv/bin/pip install -r scripts/requirements-turnstile.tx
 2. 池不可用时回退 one-shot `scripts/turnstile_mint.py`  
 3. 再回退 chromedp（CF 下通常更差）  
 
+```bash
+# 并行度由 start 指定，不写 config.env
+grok start -t 10 --thread 2
+```
+
 ```env
 TURNSTILE_PROVIDER=browser
-TURNSTILE_WORKERS=2   # 并行槽位；机器内存紧可改 1，富裕可试 3–4
 ```
 
 可选外接 YesCaptcha 形 farm：

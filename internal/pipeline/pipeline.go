@@ -696,15 +696,12 @@ func deriveWorkers(cfg config.Config) (s, p, c, oa, phys int) {
 			phys = 2
 		}
 	}
-	// Browser Turnstile: parallel persistent pool slots (TURNSTILE_WORKERS / auto).
+	// Browser Turnstile: parallel slots from runtime --thread (not config.env).
 	prov := strings.ToLower(strings.TrimSpace(cfg.TurnstileProvider))
 	if prov == "" || prov == "browser" || prov == "local" || prov == "playwright" || prov == "pool" {
 		s = cfg.TurnstileWorkers
 		if s <= 0 {
 			s = 2
-			if phys > 0 && phys < s {
-				s = phys
-			}
 		}
 		if s > 8 {
 			s = 8
@@ -713,9 +710,15 @@ func deriveWorkers(cfg config.Config) (s, p, c, oa, phys int) {
 			s = 1
 		}
 		// phys caps concurrent browser mints (= pool slots)
+		if cfg.PhysicalCap > 0 && cfg.PhysicalCap < s {
+			s = cfg.PhysicalCap
+		}
 		phys = s
 	} else {
 		s = phys
+		if cfg.TurnstileWorkers > 0 {
+			s = cfg.TurnstileWorkers
+		}
 	}
 	// P workers: don't spawn 8 when target is 5 (was flooding tempmail).
 	target := cfg.Target

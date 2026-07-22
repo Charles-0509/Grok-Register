@@ -83,12 +83,20 @@ func TryLock(lockPath string) (func(), error) {
 }
 
 // StartBackground re-execs self with --worker and returns child PID.
-func StartBackground(target int, runID string) (int, error) {
+// threads is concurrent mint/register workers (1–8).
+func StartBackground(target, threads int, runID string) (int, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return 0, err
 	}
-	args := []string{workerFlag, "--target", strconv.Itoa(target)}
+	if threads < 1 {
+		threads = 2
+	}
+	args := []string{
+		workerFlag,
+		"--target", strconv.Itoa(target),
+		"--threads", strconv.Itoa(threads),
+	}
 	if runID != "" {
 		args = append(args, "--run-id", runID)
 	}

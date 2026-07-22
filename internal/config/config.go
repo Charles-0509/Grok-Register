@@ -2,11 +2,16 @@ package config
 
 import (
 	"bufio"
+	_ "embed"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
+
+//go:embed example.env
+var embeddedExample string
 
 type EmailMode string
 
@@ -32,13 +37,13 @@ type Config struct {
 	ClearanceProxy   string
 	ClearanceURLs    string
 
-	Target      int
-	PhysicalCap int
-
+	// Target / TurnstileWorkers are RUNTIME-ONLY (CLI or interactive start).
+	// Not loaded from or saved to config.env.
+	Target           int
+	PhysicalCap      int
 	TurnstileProvider string
 	LiteSolverURL     string
-	// Parallel persistent CloakBrowser workers (browser mint). 0 = auto (min(2, PhysicalCap)).
-	TurnstileWorkers int
+	TurnstileWorkers  int // 1-8 concurrent register/mint threads; set by start
 
 	ProtocolHTTP bool
 	HTTPPoolSize int
@@ -75,11 +80,11 @@ func Defaults() Config {
 		FlareSolverrURL:       "http://127.0.0.1:8191",
 		ClearanceProxy:        "http://privoxy:8118",
 		ClearanceURLs:         "https://accounts.x.ai,https://x.ai,https://status.x.ai,https://console.x.ai,https://auth.x.ai",
-		Target:                10,
+		Target:                0, // set by start CLI/prompt
 		PhysicalCap:           0,
 		TurnstileProvider:     "browser",
 		LiteSolverURL:         "http://127.0.0.1:5072",
-		TurnstileWorkers:      0, // auto
+		TurnstileWorkers:      0, // set by start CLI/prompt
 		ProtocolHTTP:          true,
 		HTTPPoolSize:          8,
 		TempmailLOLRetries:    30,
@@ -137,7 +142,7 @@ func Save(path string, cfg Config) error {
 	if cfg.LiteSolverURL != "" {
 		b.WriteString(fmt.Sprintf("LITE_SOLVER_URL=%s\n", cfg.LiteSolverURL))
 	}
-	b.WriteString(fmt.Sprintf("TURNSTILE_WORKERS=%d\n", cfg.TurnstileWorkers))
+	// TURNSTILE_WORKERS / TARGET: not persisted — use `grok start -t N --thread M`
 	b.WriteString(fmt.Sprintf("PROTOCOL_HTTP=%s\n", bool01(cfg.ProtocolHTTP)))
 	b.WriteString(fmt.Sprintf("HTTP_POOL_SIZE=%d\n", cfg.HTTPPoolSize))
 	b.WriteString(fmt.Sprintf("TEMPMAIL_LOL_RETRIES=%d\n", cfg.TempmailLOLRetries))
@@ -223,6 +228,35 @@ func ClampTarget(n int) (int, error) {
 	return n, nil
 }
 
+// ClampThreads limits concurrent register/mint threads to 1–8.
+func ClampThreads(n int) (int, error) {
+	if n < 1 {
+		return 0, fmt.Errorf("thread must be >= 1, got %d", n)
+	}
+	if n > 8 {
+		return 0, fmt.Errorf("thread max is 8, got %d", n)
+	}
+	return n, nil
+}
+
+// SyncExample writes/updates ~/.grok/config.env.example from the embedded template
+// so users see newly added keys after upgrades.
+func SyncExample(homeDir string) error {
+	if homeDir == "" {
+		return fmt.Errorf("empty home dir")
+	}
+	if err := os.MkdirAll(homeDir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(homeDir, "config.env.example")
+	return os.WriteFile(path, []byte(embeddedExample), 0o644)
+}
+
+// ExamplePath returns path to user-local example file.
+func ExamplePath(homeDir string) string {
+	return filepath.Join(homeDir, "config.env.example")
+}
+
 func parseEnvFile(content string) map[string]string {
 	out := map[string]string{}
 	for _, line := range strings.Split(content, "\n") {
@@ -282,11 +316,7 @@ func applyMap(cfg *Config, env map[string]string) {
 	if v, ok := env["LITE_SOLVER_URL"]; ok {
 		cfg.LiteSolverURL = v
 	}
-	if v, ok := env["TURNSTILE_WORKERS"]; ok {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.TurnstileWorkers = n
-		}
-	}
+	// TURNSTILE_WORKERS / TARGET intentionally ignored from env (CLI-only).
 	if v, ok := env["PROTOCOL_HTTP"]; ok {
 		cfg.ProtocolHTTP = truthy(v)
 	}
