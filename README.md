@@ -29,91 +29,128 @@ grok upload                # 手动上传 CPA JSON 到 Management API
 
 ---
 
-## 一键安装（推荐，Debian / Ubuntu）
+## 一键安装（推荐）
 
-需要 **root / sudo**。会安装系统库、Go、Docker、源码、CLI、Playwright/CloakBrowser、清障栈，并写入默认 `config.env`。
+`scripts/install.sh` 自动识别平台：
 
-### 默认一行
+| 平台 | 前提 | 默认安装位置 |
+|------|------|----------------|
+| **Linux**（Debian/Ubuntu） | root / sudo | `/opt/Grok-Register`，数据 `/root/.grok` |
+| **macOS** | 已装 **Homebrew** + **Docker Desktop**（缺则提示安装命令后退出） | `~/Grok-Register`，数据 `~/.grok`，CLI `~/.local/bin` |
+
+会拉源码、编译 CLI、装 Playwright/CloakBrowser、起 clearance、写默认 `config.env`。
+
+### Linux 一行
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scripts/install.sh | sudo bash
 ```
 
-默认结果：
-
-| 项 | 路径 / 值 |
-|----|-----------|
-| 命令 | `grok` → `/usr/local/bin/grok` |
-| 源码 | `/opt/Grok-Register`（并软链 `/opt/Grok-Reg`） |
-| 数据 | `/root/.grok`（`GROK_HOME`） |
+| 项 | 默认 |
+|----|------|
+| 命令 | `/usr/local/bin/grok` |
+| 源码 | `/opt/Grok-Register`（软链 `/opt/Grok-Reg`） |
+| 数据 | `/root/.grok` |
 | Python | `/opt/cloakbrowser-venv/bin/python` |
-| mint 脚本 | `/usr/local/share/grok-reg/turnstile_{mint,pool}.py` |
-| 清障 | `clearance/` compose（WARP / Privoxy / FlareSolverr） |
+| mint | `/usr/local/share/grok-reg/turnstile_{mint,pool}.py` |
+
+### macOS 一行
+
+**先**确认：
+
+```bash
+# 1) Homebrew — 若无:
+# /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# 2) Docker Desktop — 若无:
+# brew install --cask docker
+# 打开 Docker 应用，等引擎就绪: docker info
+```
+
+然后（**不要 sudo**）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scripts/install.sh | bash
+```
+
+| 项 | 默认 |
+|----|------|
+| 命令 | `~/.local/bin/grok` |
+| 源码 | `~/Grok-Register` |
+| 数据 | `~/.grok` |
+| Python | `~/.local/share/cloakbrowser-venv/bin/python` |
+| mint | `~/.local/share/grok-reg/turnstile_{mint,pool}.py` |
+| 环境 | 写入 `~/.zprofile` / `~/.zshrc` |
+
+缺 brew 或 Docker 时脚本会打印安装命令并退出，装好后重跑同一行即可。
 
 ### 自定义命令名 / 目录
 
-避免与其它 `grok` CLI 冲突，或改数据盘：
-
 ```bash
-# 命令改名为 grok-reg
-curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scripts/install.sh | \
-  sudo bash -s -- --command grok-reg
+# Linux：改命令名
+curl -fsSL .../install.sh | sudo bash -s -- --command grok-reg
 
-# 自定义安装目录 + 数据目录
-curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scripts/install.sh | \
-  sudo bash -s -- \
-    --command grok \
-    --install-dir /data/Grok-Register \
-    --home /data/grok-data
+# Linux：自定义目录
+curl -fsSL .../install.sh | sudo bash -s -- \
+  --install-dir /data/Grok-Register --home /data/grok-data
 
-# 环境变量写法（等价）
-curl -fsSL ... | sudo COMMAND_NAME=grok-reg INSTALL_DIR=/opt/Grok-Register GROK_HOME=/root/.grok bash
+# macOS：改命令名 / 把二进制装到 brew 前缀
+curl -fsSL .../install.sh | bash -s -- --command grok-reg
+curl -fsSL .../install.sh | bash -s -- --bin-dir "$(brew --prefix)/bin"
 ```
 
 ### 常用选项
 
-| 选项 / 环境变量 | 默认 | 说明 |
-|-----------------|------|------|
-| `--command` / `COMMAND_NAME` | `grok` | CLI 命令名 |
-| `--install-dir` / `INSTALL_DIR` | `/opt/Grok-Register` | 源码目录 |
-| `--home` / `GROK_HOME` | `/root/.grok` | 配置与 outputs |
-| `--bin-dir` / `BIN_DIR` | `/usr/local/bin` | 二进制目录 |
-| `--share-dir` / `SHARE_DIR` | `/usr/local/share/grok-reg` | mint 脚本 |
-| `--venv-dir` / `VENV_DIR` | `/opt/cloakbrowser-venv` | Python venv |
-| `--repo` / `REPO_URL` | 本仓库 | 可改镜像源 |
-| `--branch` / `BRANCH` | `main` | 分支 |
-| `--skip-docker` | off | 不装 Docker |
-| `--skip-clearance` | off | 不起清障栈 |
-| `--skip-browser` | off | 不装 Playwright（Turnstile 不可用） |
-| `--skip-go` | off | 不自动装 Go |
-| `--no-start-clearance` | off | 装 Docker 但不 `compose up` |
+| 选项 / 环境变量 | Linux 默认 | macOS 默认 | 说明 |
+|-----------------|------------|------------|------|
+| `--command` | `grok` | 同左 | CLI 命令名 |
+| `--install-dir` | `/opt/Grok-Register` | `~/Grok-Register` | 源码 |
+| `--home` | `/root/.grok` | `~/.grok` | 数据 |
+| `--bin-dir` | `/usr/local/bin` | `~/.local/bin` | 二进制 |
+| `--share-dir` | `/usr/local/share/grok-reg` | `~/.local/share/grok-reg` | mint 脚本 |
+| `--venv-dir` | `/opt/cloakbrowser-venv` | `~/.local/share/cloakbrowser-venv` | Python venv |
+| `--skip-docker` | off | off | 不检查/不装 Docker |
+| `--skip-clearance` | off | off | 不起清障 |
+| `--skip-browser` | off | off | 不装 Playwright |
+| `--skip-go` | off | off | 不自动装 Go |
+| `--no-start-clearance` | off | off | 不 `compose up` |
 
-本地已 clone 时：
+本地已 clone：
 
 ```bash
-cd /path/to/Grok-Register
-sudo bash scripts/install.sh --command grok-reg --home /root/.grok
-# 或
-sudo make install APP=grok-reg
+# Linux
+sudo bash scripts/install.sh --command grok-reg
+# macOS
+bash scripts/install.sh --command grok-reg
+# 或仅装二进制
+make build && sudo make install          # Linux
+make build && make install PREFIX="$HOME/.local" APP=grok
 ```
 
 ### 装完立刻跑
 
 ```bash
-# 新 shell 会自动 source /etc/profile.d/grok-register.sh
-# 当前 shell 可手动：
+# Linux
 export GROK_HOME=/root/.grok
 export GROK_PYTHON=/opt/cloakbrowser-venv/bin/python
 
-grok start                 # 或你自定义的命令名
+# macOS（或新开终端，已写进 zprofile）
+export PATH="$PATH:$HOME/.local/bin"
+export GROK_HOME="$HOME/.grok"
+export GROK_PYTHON="$HOME/.local/share/cloakbrowser-venv/bin/python"
+
+grok start
 grok status
 grok logs -f
 ```
 
-若 clearance 未 healthy：
+clearance：
 
 ```bash
+# Linux
 cd /opt/Grok-Register/clearance && docker compose up -d && docker compose ps
+# macOS
+cd ~/Grok-Register/clearance && docker compose up -d && docker compose ps
 ```
 
 ---
@@ -327,11 +364,9 @@ make build && sudo make install
 
 ### macOS 备注
 
-- Go / Docker Desktop 自行安装  
-- Turnstile：venv + `requirements-turnstile.txt` + `python -m cloakbrowser install`  
-- 清障：`cd clearance && docker compose up -d`  
-- 一键脚本目前面向 Debian/Ubuntu
-
+- **推荐一键**：先装 Homebrew + Docker Desktop，再 `curl .../install.sh | bash`（见上文）  
+- 手动：`brew install go python`，venv + CloakBrowser，`make build && make install PREFIX=$HOME/.local`  
+- 清障：打开 Docker Desktop 后 `cd ~/Grok-Register/clearance && docker compose up -d`
 ---
 
 ## 命令一览
