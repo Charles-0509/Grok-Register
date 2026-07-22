@@ -28,11 +28,13 @@ install:
 	fi
 	install -d $(BINDIR)
 	install -m 755 bin/$(APP) $(BINDIR)/$(APP)
-	# Playwright mint helper (Turnstile) — same path original project uses
+	# Playwright mint helpers (Turnstile) — one-shot + persistent pool
 	install -d /usr/local/share/grok-reg
 	install -m 755 scripts/turnstile_mint.py /usr/local/share/grok-reg/turnstile_mint.py
+	install -m 755 scripts/turnstile_pool.py /usr/local/share/grok-reg/turnstile_pool.py
 	@echo "installed: $(BINDIR)/$(APP)"
 	@echo "installed: /usr/local/share/grok-reg/turnstile_mint.py"
+	@echo "installed: /usr/local/share/grok-reg/turnstile_pool.py"
 	@echo "try: grok help"
 	@echo "Turnstile: pip install -r scripts/requirements-turnstile.txt && python -m cloakbrowser install"
 

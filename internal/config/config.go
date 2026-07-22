@@ -12,6 +12,7 @@ type EmailMode string
 
 const (
 	EmailTempmail EmailMode = "tempmail"
+	EmailTestmail EmailMode = "testmail"
 	EmailCustom   EmailMode = "custom"
 )
 
@@ -19,6 +20,11 @@ type Config struct {
 	EmailMode   EmailMode
 	EmailDomain string
 	EmailAPI    string
+
+	// testmail.app (GitHub Student Pack Essential etc.)
+	TestmailAPIKey    string
+	TestmailNamespace string
+	TestmailDomain    string // default inbox.testmail.app
 
 	ClearanceEnabled bool
 	RegisterProxy    string
@@ -31,6 +37,8 @@ type Config struct {
 
 	TurnstileProvider string
 	LiteSolverURL     string
+	// Parallel persistent CloakBrowser workers (browser mint). 0 = auto (min(2, PhysicalCap)).
+	TurnstileWorkers int
 
 	ProtocolHTTP bool
 	HTTPPoolSize int
@@ -61,6 +69,7 @@ func Defaults() Config {
 	return Config{
 		EmailMode:             EmailTempmail,
 		EmailAPI:              "http://127.0.0.1:8080",
+		TestmailDomain:        "inbox.testmail.app",
 		ClearanceEnabled:      true,
 		RegisterProxy:         "http://127.0.0.1:40080",
 		FlareSolverrURL:       "http://127.0.0.1:8191",
@@ -70,6 +79,7 @@ func Defaults() Config {
 		PhysicalCap:           0,
 		TurnstileProvider:     "browser",
 		LiteSolverURL:         "http://127.0.0.1:5072",
+		TurnstileWorkers:      0, // auto
 		ProtocolHTTP:          true,
 		HTTPPoolSize:          8,
 		TempmailLOLRetries:    30,
@@ -114,6 +124,10 @@ func Save(path string, cfg Config) error {
 	if cfg.EmailAPI != "" {
 		b.WriteString(fmt.Sprintf("EMAIL_API=%s\n", cfg.EmailAPI))
 	}
+	// testmail secrets: never auto-written (set manually)
+	if cfg.TestmailDomain != "" {
+		b.WriteString(fmt.Sprintf("TESTMAIL_DOMAIN=%s\n", cfg.TestmailDomain))
+	}
 	b.WriteString(fmt.Sprintf("CLEARANCE_ENABLED=%s\n", bool01(cfg.ClearanceEnabled)))
 	b.WriteString(fmt.Sprintf("REGISTER_PROXY=%s\n", cfg.RegisterProxy))
 	b.WriteString(fmt.Sprintf("FLARESOLVERR_URL=%s\n", cfg.FlareSolverrURL))
@@ -123,6 +137,7 @@ func Save(path string, cfg Config) error {
 	if cfg.LiteSolverURL != "" {
 		b.WriteString(fmt.Sprintf("LITE_SOLVER_URL=%s\n", cfg.LiteSolverURL))
 	}
+	b.WriteString(fmt.Sprintf("TURNSTILE_WORKERS=%d\n", cfg.TurnstileWorkers))
 	b.WriteString(fmt.Sprintf("PROTOCOL_HTTP=%s\n", bool01(cfg.ProtocolHTTP)))
 	b.WriteString(fmt.Sprintf("HTTP_POOL_SIZE=%d\n", cfg.HTTPPoolSize))
 	b.WriteString(fmt.Sprintf("TEMPMAIL_LOL_RETRIES=%d\n", cfg.TempmailLOLRetries))
@@ -145,13 +160,30 @@ func InteractiveSetup(path string) (Config, error) {
 	cfg := Defaults()
 	fmt.Println()
 	fmt.Println("选择邮箱模式:")
-	fmt.Println("  [1] 免费临时邮箱           (默认 · 零配置 · 直接回车)")
-	fmt.Println("  [2] 自建域名邮箱           (需 Cloudflare Email Routing + 本地 webhook)")
-	fmt.Print("输入 1 或 2 [1]: ")
+	fmt.Println("  [1] 免费临时邮箱           (tempmail.lol · 默认 · 直接回车)")
+	fmt.Println("  [2] testmail.app           (GitHub Student Pack Essential 等)")
+	fmt.Println("  [3] 自建域名邮箱           (Cloudflare Email Routing + webhook)")
+	fmt.Print("输入 1 / 2 / 3 [1]: ")
 	reader := bufio.NewReader(os.Stdin)
 	line, _ := reader.ReadString('\n')
 	line = strings.TrimSpace(line)
-	if line == "2" {
+	switch line {
+	case "2":
+		cfg.EmailMode = EmailTestmail
+		fmt.Print("  TESTMAIL_API_KEY: ")
+		key, _ := reader.ReadString('\n')
+		cfg.TestmailAPIKey = strings.TrimSpace(key)
+		fmt.Print("  TESTMAIL_NAMESPACE: ")
+		ns, _ := reader.ReadString('\n')
+		cfg.TestmailNamespace = strings.TrimSpace(ns)
+		fmt.Print("  TESTMAIL_DOMAIN [inbox.testmail.app]: ")
+		dom, _ := reader.ReadString('\n')
+		dom = strings.TrimSpace(dom)
+		if dom == "" {
+			dom = "inbox.testmail.app"
+		}
+		cfg.TestmailDomain = dom
+	case "3":
 		cfg.EmailMode = EmailCustom
 		fmt.Print("  你的域名 (如 example.com): ")
 		dom, _ := reader.ReadString('\n')
@@ -163,11 +195,19 @@ func InteractiveSetup(path string) (Config, error) {
 			api = "http://127.0.0.1:8080"
 		}
 		cfg.EmailAPI = api
-	} else {
+	default:
 		cfg.EmailMode = EmailTempmail
 	}
 	if err := Save(path, cfg); err != nil {
 		return cfg, err
+	}
+	// Append secrets not written by Save
+	if cfg.EmailMode == EmailTestmail {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, _ = fmt.Fprintf(f, "TESTMAIL_API_KEY=%s\nTESTMAIL_NAMESPACE=%s\n", cfg.TestmailAPIKey, cfg.TestmailNamespace)
+			_ = f.Close()
+		}
 	}
 	fmt.Printf("[*] 已写入 %s\n", path)
 	return cfg, nil
@@ -212,6 +252,15 @@ func applyMap(cfg *Config, env map[string]string) {
 	if v, ok := env["EMAIL_API"]; ok {
 		cfg.EmailAPI = v
 	}
+	if v, ok := env["TESTMAIL_API_KEY"]; ok {
+		cfg.TestmailAPIKey = v
+	}
+	if v, ok := env["TESTMAIL_NAMESPACE"]; ok {
+		cfg.TestmailNamespace = v
+	}
+	if v, ok := env["TESTMAIL_DOMAIN"]; ok {
+		cfg.TestmailDomain = v
+	}
 	if v, ok := env["CLEARANCE_ENABLED"]; ok {
 		cfg.ClearanceEnabled = truthy(v)
 	}
@@ -232,6 +281,11 @@ func applyMap(cfg *Config, env map[string]string) {
 	}
 	if v, ok := env["LITE_SOLVER_URL"]; ok {
 		cfg.LiteSolverURL = v
+	}
+	if v, ok := env["TURNSTILE_WORKERS"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.TurnstileWorkers = n
+		}
 	}
 	if v, ok := env["PROTOCOL_HTTP"]; ok {
 		cfg.ProtocolHTTP = truthy(v)

@@ -145,23 +145,32 @@ func (e *Engine) run(ctx context.Context) error {
 		return err
 	}
 	e.mail = email.New(email.Config{
-		Mode:          cfg.EmailMode,
-		Domain:        cfg.EmailDomain,
-		API:           cfg.EmailAPI,
-		LOLRetries:    cfg.TempmailLOLRetries,
-		LOLIntervalMS: cfg.TempmailLOLIntervalMS,
+		Mode:              cfg.EmailMode,
+		Domain:            cfg.EmailDomain,
+		API:               cfg.EmailAPI,
+		LOLRetries:        cfg.TempmailLOLRetries,
+		LOLIntervalMS:     cfg.TempmailLOLIntervalMS,
+		TestmailAPIKey:    cfg.TestmailAPIKey,
+		TestmailNamespace: cfg.TestmailNamespace,
+		TestmailDomain:    cfg.TestmailDomain,
 	})
+	if cfg.EmailMode == config.EmailTestmail {
+		log.Infof("Email mode=testmail namespace=%s domain=%s", cfg.TestmailNamespace, cfg.TestmailDomain)
+	} else {
+		log.Infof("Email mode=%s", cfg.EmailMode)
+	}
 	e.turn = turnstile.New(turnstile.Options{
 		Provider: cfg.TurnstileProvider,
 		LiteURL:  cfg.LiteSolverURL,
 		Proxy:    cfg.RegisterProxy,
 		Clear:    e.cm,
+		Workers:  sWorkers, // parallel S = pool slots
 	})
 	if c, ok := e.turn.(turnstile.Closer); ok {
 		defer c.Close()
 	}
-	log.Infof("Turnstile provider=%s (Playwright mint preferred, chromedp fallback)", e.turn.Name())
-	log.Infof("Turnstile mint: python=%s script=%s", turnstile.DetectedPython(), turnstile.DetectedScript())
+	log.Infof("Turnstile provider=%s workers=%d (pool → one-shot mint → chromedp)", e.turn.Name(), sWorkers)
+	log.Infof("Turnstile mint: python=%s pool=%s script=%s", turnstile.DetectedPython(), turnstile.DetectedPoolScript(), turnstile.DetectedScript())
 	e.uploader = cpa.NewUploader(cpa.UploadConfig{
 		Enabled:      cfg.CPAUploadEnabled,
 		BaseURL:      cfg.CPAManagementBase,
@@ -575,10 +584,24 @@ func deriveWorkers(cfg config.Config) (s, p, c, oa, phys int) {
 			phys = 2
 		}
 	}
-	// Browser Turnstile: serial-ish mint (original holds Physical_Sem per solve).
-	if strings.EqualFold(cfg.TurnstileProvider, "browser") || cfg.TurnstileProvider == "" {
-		s = 1
-		phys = 1 // one browser solve at a time — matches Python holding Physical_Sem
+	// Browser Turnstile: parallel persistent pool slots (TURNSTILE_WORKERS / auto).
+	prov := strings.ToLower(strings.TrimSpace(cfg.TurnstileProvider))
+	if prov == "" || prov == "browser" || prov == "local" || prov == "playwright" || prov == "pool" {
+		s = cfg.TurnstileWorkers
+		if s <= 0 {
+			s = 2
+			if phys > 0 && phys < s {
+				s = phys
+			}
+		}
+		if s > 8 {
+			s = 8
+		}
+		if s < 1 {
+			s = 1
+		}
+		// phys caps concurrent browser mints (= pool slots)
+		phys = s
 	} else {
 		s = phys
 	}

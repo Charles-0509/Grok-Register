@@ -216,18 +216,29 @@ CPA_UPLOAD_NAME_TEMPLATE={email}.json
 EOF
 ```
 
-自建邮箱（可选）：
+邮箱模式：
 
 ```env
-EMAIL_MODE=custom
-EMAIL_DOMAIN=example.com
-EMAIL_API=http://127.0.0.1:8080
+# 1) 公共临时邮箱（默认，无需 token）
+EMAIL_MODE=tempmail
+
+# 2) testmail.app（GitHub Student Pack Essential 等）
+# EMAIL_MODE=testmail
+# TESTMAIL_API_KEY=你的_apikey
+# TESTMAIL_NAMESPACE=你的_namespace
+# TESTMAIL_DOMAIN=inbox.testmail.app
+# 地址形态：{namespace}.{tag}@inbox.testmail.app — tag 自动随机，无需预注册
+
+# 3) 自建域名
+# EMAIL_MODE=custom
+# EMAIL_DOMAIN=example.com
+# EMAIL_API=http://127.0.0.1:8080
 ```
 
 参考 `cloudflare/email-worker.js` 配置 Cloudflare Email Routing catch-all。
 
-临时邮箱默认公共 **tempmail.lol** + mail.tm 系 fallback，**无需私人 API Token**。
-
+`tempmail` 默认公共 **tempmail.lol** + mail.tm 系 fallback，**无需私人 API Token**。  
+`testmail` 需要 console 里的 **API key + namespace**（密钥只写本地 `config.env`，勿提交仓库）。
 ### 7. 启动与运维
 
 ```bash
@@ -328,8 +339,14 @@ sudo /opt/cloakbrowser-venv/bin/pip install -r scripts/requirements-turnstile.tx
 
 默认 `browser`：
 
-1. 优先调用 `scripts/turnstile_mint.py`（**Playwright + CloakBrowser 二进制**，对齐原 `register.py`）  
-2. 脚本不可用时回退 chromedp（在 CF 下成功率通常更低）  
+1. **常驻池** `scripts/turnstile_pool.py`：启动 N 个 CloakBrowser 进程，**复用浏览器、并行 mint**（`TURNSTILE_WORKERS`，默认约 2）  
+2. 池不可用时回退 one-shot `scripts/turnstile_mint.py`  
+3. 再回退 chromedp（CF 下通常更差）  
+
+```env
+TURNSTILE_PROVIDER=browser
+TURNSTILE_WORKERS=2   # 并行槽位；机器内存紧可改 1，富裕可试 3–4
+```
 
 可选外接 YesCaptcha 形 farm：
 
@@ -340,6 +357,17 @@ LITE_SOLVER_URL=http://127.0.0.1:5072
 
 仓库**不内置** farm 镜像。
 
+### 代理：WARP 清障 vs HTTP 代理池
+
+| | **WARP + Privoxy（本仓库默认）** | **HTTP 代理池** |
+|--|----------------------------------|-----------------|
+| 成本 | 低 / 免费 | 按量或包月 |
+| 出口质量 | 中等；CF 友好但 IP 相对固定、易被限 | 可换大量 IP；质量参差 |
+| 配置 | 本机 compose 即可 | 需池服务 + 轮换逻辑 |
+| 适合 | 个人小批量、本机注册机 | 大批量、强隔离、规避单 IP 限流 |
+| 风险 | 同出口并发高时限流 | 垃圾代理导致 Turnstile/注册失败 |
+
+**建议：** 单机自用优先 **WARP 清障**；要冲量再上可靠 HTTP 池，并把 `REGISTER_PROXY` / 浏览器 mint 代理指到池。两者可并存（注册走池、其它走直连），但当前默认设计是 **统一走 `REGISTER_PROXY`**。
 ---
 
 ## CPA 上传
@@ -388,7 +416,8 @@ Grok-Register/
 │   ├── pipeline/             # S/P/C + OAuth + CPA
 │   └── cpa/                  # 落盘 + Management 上传
 ├── scripts/
-│   ├── turnstile_mint.py     # 与原项目同逻辑的 mint
+│   ├── turnstile_mint.py     # one-shot mint
+│   ├── turnstile_pool.py     # 常驻多浏览器并行 mint
 │   └── requirements-turnstile.txt
 ├── clearance/                # docker compose 清障栈
 ├── cloudflare/email-worker.js

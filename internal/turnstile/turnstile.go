@@ -107,6 +107,8 @@ type Options struct {
 	LiteURL  string
 	Proxy    string
 	Clear    *clearance.Manager
+	// Workers: parallel persistent CloakBrowser slots (browser pool). 0 = auto (2).
+	Workers int
 }
 
 // chain tries primary then fallback.
@@ -165,16 +167,26 @@ func New(opts Options) Provider {
 		return NewLite(url)
 	case "chromedp":
 		return NewBrowser(opts.Proxy, opts.Clear)
-	case "browser", "local", "playwright":
-		// Prefer Playwright (same as original). Fall back to chromedp if script missing.
-		pw := NewPlaywrightBridge(opts.Proxy, opts.Clear)
-		if pw.ScriptPath != "" && pw.Python != "" {
-			return &chain{
-				name: "browser",
-				list: []Provider{pw, NewBrowser(opts.Proxy, opts.Clear)},
-			}
+	case "browser", "local", "playwright", "pool":
+		// Prefer persistent pool (parallel CloakBrowser), then one-shot mint script, then chromedp.
+		workers := opts.Workers
+		if workers <= 0 {
+			workers = 2
 		}
-		return NewBrowser(opts.Proxy, opts.Clear)
+		pool := NewPoolBridge(opts.Proxy, opts.Clear, workers)
+		pw := NewPlaywrightBridge(opts.Proxy, opts.Clear)
+		var list []Provider
+		if pool.Available() {
+			list = append(list, pool)
+		}
+		if pw.ScriptPath != "" && pw.Python != "" {
+			list = append(list, pw)
+		}
+		list = append(list, NewBrowser(opts.Proxy, opts.Clear))
+		if len(list) == 1 {
+			return list[0]
+		}
+		return &chain{name: "browser", list: list}
 	default:
 		return NewPlaywrightBridge(opts.Proxy, opts.Clear)
 	}
