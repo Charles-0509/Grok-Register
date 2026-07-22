@@ -119,6 +119,60 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
+// setEnvKey replaces an active KEY=... line in a .env body (first match).
+// If only a commented "# KEY=" exists, uncomment and set it. Otherwise append.
+func setEnvKey(content, key, value string) string {
+	prefix := key + "="
+	commented := "# " + prefix
+	lines := strings.Split(content, "\n")
+	found := false
+	for i, line := range lines {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, prefix) {
+			lines[i] = prefix + value
+			found = true
+			break
+		}
+	}
+	if !found {
+		for i, line := range lines {
+			trim := strings.TrimSpace(line)
+			if strings.HasPrefix(trim, commented) || trim == "#"+prefix || strings.HasPrefix(trim, "#"+prefix) {
+				lines[i] = prefix + value
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		if !strings.HasSuffix(content, "\n") && content != "" {
+			lines = append(lines, "")
+		}
+		lines = append(lines, prefix+value)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// SeedFromExample writes the sectioned Chinese template (embedded example.env)
+// to path, then applies overrides (e.g. EMAIL_MODE=tempmail).
+func SeedFromExample(path string, overrides map[string]string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	content := embeddedExample
+	// Prefer 127.0.0.1 in generated config for host-side CPA default
+	content = setEnvKey(content, "CPA_MANAGEMENT_BASE", "http://127.0.0.1:8317/v0/management")
+	for k, v := range overrides {
+		if k == "" {
+			continue
+		}
+		content = setEnvKey(content, k, v)
+	}
+	return os.WriteFile(path, []byte(content), 0o600)
+}
+
+// Save writes a compact key=value config (no section comments).
+// Prefer SeedFromExample for first-time user-facing files.
 func Save(path string, cfg Config) error {
 	var b strings.Builder
 	b.WriteString("# grok-reg config\n")
@@ -158,6 +212,10 @@ func Save(path string, cfg Config) error {
 	b.WriteString(fmt.Sprintf("CPA_UPLOAD_TIMEOUT_SEC=%d\n", cfg.CPAUploadTimeoutSec))
 	b.WriteString(fmt.Sprintf("CPA_UPLOAD_RETRIES=%d\n", cfg.CPAUploadRetries))
 	b.WriteString(fmt.Sprintf("CPA_UPLOAD_NAME_TEMPLATE=%s\n", cfg.CPAUploadNameTemplate))
+	b.WriteString(fmt.Sprintf("CPA_UPLOAD_VERIFY=%s\n", bool01(cfg.CPAUploadVerify)))
+	if cfg.CPAUploadMode != "" {
+		b.WriteString(fmt.Sprintf("CPA_UPLOAD_MODE=%s\n", cfg.CPAUploadMode))
+	}
 	return os.WriteFile(path, []byte(b.String()), 0o600)
 }
 
@@ -172,6 +230,9 @@ func InteractiveSetup(path string) (Config, error) {
 	reader := bufio.NewReader(os.Stdin)
 	line, _ := reader.ReadString('\n')
 	line = strings.TrimSpace(line)
+	overrides := map[string]string{
+		"EMAIL_MODE": string(EmailTempmail),
+	}
 	switch line {
 	case "2":
 		cfg.EmailMode = EmailTestmail
@@ -188,6 +249,10 @@ func InteractiveSetup(path string) (Config, error) {
 			dom = "inbox.testmail.app"
 		}
 		cfg.TestmailDomain = dom
+		overrides["EMAIL_MODE"] = string(EmailTestmail)
+		overrides["TESTMAIL_API_KEY"] = cfg.TestmailAPIKey
+		overrides["TESTMAIL_NAMESPACE"] = cfg.TestmailNamespace
+		overrides["TESTMAIL_DOMAIN"] = cfg.TestmailDomain
 	case "3":
 		cfg.EmailMode = EmailCustom
 		fmt.Print("  你的域名 (如 example.com): ")
@@ -200,21 +265,19 @@ func InteractiveSetup(path string) (Config, error) {
 			api = "http://127.0.0.1:8080"
 		}
 		cfg.EmailAPI = api
+		overrides["EMAIL_MODE"] = string(EmailCustom)
+		overrides["EMAIL_DOMAIN"] = cfg.EmailDomain
+		overrides["EMAIL_API"] = cfg.EmailAPI
 	default:
 		cfg.EmailMode = EmailTempmail
+		overrides["EMAIL_MODE"] = string(EmailTempmail)
 	}
-	if err := Save(path, cfg); err != nil {
+	// Full sectioned Chinese template (includes CPA_MANAGEMENT_KEY= placeholder)
+	if err := SeedFromExample(path, overrides); err != nil {
 		return cfg, err
 	}
-	// Append secrets not written by Save
-	if cfg.EmailMode == EmailTestmail {
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
-		if err == nil {
-			_, _ = fmt.Fprintf(f, "TESTMAIL_API_KEY=%s\nTESTMAIL_NAMESPACE=%s\n", cfg.TestmailAPIKey, cfg.TestmailNamespace)
-			_ = f.Close()
-		}
-	}
-	fmt.Printf("[*] 已写入 %s\n", path)
+	fmt.Printf("[*] 已写入分区注释配置 %s\n", path)
+	fmt.Printf("[*] 参考模板也会同步到同目录 config.env.example\n")
 	return cfg, nil
 }
 

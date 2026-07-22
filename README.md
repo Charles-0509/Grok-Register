@@ -35,10 +35,28 @@ grok upload                # 手动上传 CPA JSON 到 Management API
 
 | 平台 | 前提 | 默认安装位置 |
 |------|------|----------------|
-| **Linux**（Debian/Ubuntu） | root / sudo | `/opt/Grok-Register`，数据 `/root/.grok` |
+| **Linux**（Debian/Ubuntu） | root / sudo | 源码 `/opt/Grok-Register`；数据优先 **`SUDO_USER` 的 `~/.grok`**（非 `/root`） |
 | **macOS** | 已装 **Homebrew** + **Docker Desktop**（缺则提示安装命令后退出） | `~/Grok-Register`，数据 `~/.grok`，CLI `~/.local/bin` |
 
-会拉源码、编译 CLI、装 Playwright/CloakBrowser、起 clearance、写默认 `config.env`。
+会拉源码、编译 CLI、装 Playwright/CloakBrowser、起 clearance，并写入**分区中文注释**的 `config.env`（与 `config.env.example` 同模板）。
+
+### 交互询问路径 / 命令名
+
+有真实 TTY 时（SSH 终端直接跑，或 `bash -s` 且 stdin 是终端）会提示：
+
+- CLI 命令名（默认 `grok`）
+- 源码目录、数据目录 `GROK_HOME`、二进制目录、venv 目录  
+
+直接回车 = 默认。无 TTY 的 `curl|sudo bash` 可能无法提问，此时：
+
+```bash
+# 显式指定（推荐）
+curl -fsSL .../install.sh | sudo bash -s -- \
+  --command grok --install-dir /opt/Grok-Register --home /home/你的用户/.grok
+
+# 或强制全默认
+curl -fsSL .../install.sh | sudo NONINTERACTIVE=1 bash
+```
 
 ### Linux 一行
 
@@ -50,10 +68,9 @@ curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scr
 |----|------|
 | 命令 | `/usr/local/bin/grok` |
 | 源码 | `/opt/Grok-Register`（软链 `/opt/Grok-Reg`） |
-| 数据 | `/root/.grok` |
+| 数据 | `sudo` 时为 **`/home/<SUDO_USER>/.grok`**，纯 root 为 `/root/.grok` |
 | Python | `/opt/cloakbrowser-venv/bin/python` |
 | mint | `/usr/local/share/grok-reg/turnstile_{mint,pool}.py` |
-
 ### macOS 一行
 
 **先**确认：
@@ -165,6 +182,31 @@ cd ~/Grok-Register/clearance && docker compose up -d && docker compose ps
 | Docker | 清障栈（强烈推荐） | 注册/邮箱/CF 更容易挂 |
 | CPA Management（可选） | `grok upload` / 自动上传 | 本地仍有 `CPA/*.json` |
 
+### 推荐硬件（运行时，非编译）
+
+| 场景 | 内存 | CPU | 说明 |
+|------|------|-----|------|
+| **最低能跑** | **2 GiB** + 2 GiB swap | 1–2 vCPU | 仅 `--thread 1`；清障 + 1 个 Chromium |
+| **舒适** | **4 GiB** | 2–4 vCPU | `--thread 1~2` |
+| **冲量** | **8 GiB+** | 4+ vCPU | `--thread 3~4`（再高收益有限） |
+
+粗算占用（`start -t 1 --thread 1`）：
+
+| 组件 | 约占用 |
+|------|--------|
+| WARP + Privoxy + FlareSolverr | 400–900 MiB |
+| CloakBrowser / Chromium（1 个） | 300–800 MiB |
+| grok CLI + Python mint | 50–150 MiB |
+| 系统 / Docker 开销 | 200–400 MiB |
+| **合计** | **约 1.2–2.5 GiB** 峰值 |
+
+**≤1 GiB 内存的机器会非常卡**（大量 swap）：第一次 `start` 还要冷启动容器镜像层 + 拉起浏览器，更慢。优化：
+
+1. 始终 `--thread 1`（低配禁止 2+）  
+2. 保证 **≥2 GiB swap**（你机上已有 4G swap 是对的）  
+3. 装完后先让 clearance `healthy` 再 start，避免并行拉镜像  
+4. 不要同时跑其它重服务（面板、多开 Docker）  
+5. 可选：不需要自动清障预热时关 `CLEARANCE_ENABLED=0`（成功率可能下降）
 ---
 
 ## 完整部署（手动分步）

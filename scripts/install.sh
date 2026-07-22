@@ -3,13 +3,14 @@
 #
 # Linux (Debian/Ubuntu，需 root/sudo):
 #   curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scripts/install.sh | sudo bash
+#   # 有 TTY 时会询问：命令名 / 安装目录 / 数据目录（回车=默认）
 #
 # macOS（需已装 Homebrew + Docker Desktop，普通用户即可）:
 #   curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scripts/install.sh | bash
 #
-# 自定义:
-#   curl -fsSL ... | sudo bash -s -- --command grok-reg --install-dir /opt/Grok-Register
-#   curl -fsSL ... | bash -s -- --command grok --home "$HOME/.grok"
+# 非交互（CI / 无 TTY）:
+#   curl -fsSL ... | sudo NONINTERACTIVE=1 bash
+#   curl -fsSL ... | sudo bash -s -- --yes --command grok --install-dir /opt/Grok-Register
 #
 # 选项 / 环境变量见 --help。
 
@@ -39,7 +40,7 @@ case "$ARCH" in
 esac
 
 # ---------------------------------------------------------------------------
-# 默认值（可被环境变量或 CLI 覆盖；macOS 默认装在用户目录）
+# 默认值
 # ---------------------------------------------------------------------------
 COMMAND_NAME="${COMMAND_NAME:-grok}"
 REPO_URL="${REPO_URL:-https://github.com/Charles-0509/Grok-Register.git}"
@@ -50,8 +51,31 @@ SKIP_CLEARANCE="${SKIP_CLEARANCE:-0}"
 SKIP_BROWSER="${SKIP_BROWSER:-0}"
 SKIP_GO_INSTALL="${SKIP_GO_INSTALL:-0}"
 START_CLEARANCE="${START_CLEARANCE:-1}"
+# 0=有 TTY 时询问路径/命令名；1=全默认（CI）
+NONINTERACTIVE="${NONINTERACTIVE:-0}"
 
-# 路径：若调用方未通过环境变量指定，按 OS 给默认
+# 环境变量是否在进脚本前已显式设置（显式则不再交互问该项）
+_ENV_COMMAND_NAME="${COMMAND_NAME-}"
+_ENV_INSTALL_DIR="${INSTALL_DIR-}"
+_ENV_GROK_HOME="${GROK_HOME-}"
+_ENV_BIN_DIR="${BIN_DIR-}"
+_ENV_SHARE_DIR="${SHARE_DIR-}"
+_ENV_VENV_DIR="${VENV_DIR-}"
+
+SET_COMMAND=0
+SET_INSTALL_DIR=0
+SET_HOME=0
+SET_BIN_DIR=0
+SET_SHARE_DIR=0
+SET_VENV_DIR=0
+# 非默认命令名视为用户已指定
+[ -n "$_ENV_COMMAND_NAME" ] && [ "$_ENV_COMMAND_NAME" != "grok" ] && SET_COMMAND=1
+[ -n "$_ENV_INSTALL_DIR" ] && SET_INSTALL_DIR=1
+[ -n "$_ENV_GROK_HOME" ] && SET_HOME=1
+[ -n "$_ENV_BIN_DIR" ] && SET_BIN_DIR=1
+[ -n "$_ENV_SHARE_DIR" ] && SET_SHARE_DIR=1
+[ -n "$_ENV_VENV_DIR" ] && SET_VENV_DIR=1
+
 if [ "$OS" = "darwin" ]; then
   _HOME="${HOME:-/Users/$(id -un)}"
   INSTALL_DIR="${INSTALL_DIR:-${_HOME}/Grok-Register}"
@@ -76,40 +100,37 @@ Grok-Register 一键部署
   macOS  需已安装 Homebrew + Docker Desktop；缺则提示安装命令后退出
          默认装到用户目录（无需 sudo）
 
+交互:
+  终端有 TTY 时会询问命令名 / 安装目录 / 数据目录（直接回车=默认）。
+  curl|bash 且无 TTY，或 NONINTERACTIVE=1 / --yes，则全用默认值。
+
 用法:
   install.sh [选项]
 
 选项:
   --command NAME        CLI 命令名（默认 grok）
   --install-dir PATH    源码目录
-                          Linux 默认 /opt/Grok-Register
-                          macOS 默认 ~/Grok-Register
   --home PATH           数据目录 GROK_HOME
-                          Linux 默认 /root/.grok
-                          macOS 默认 ~/.grok
   --bin-dir PATH        二进制目录
-                          Linux 默认 /usr/local/bin
-                          macOS 默认 ~/.local/bin
   --share-dir PATH      mint 脚本目录
   --venv-dir PATH       Python venv 路径
   --repo URL            Git 仓库
   --branch NAME         分支（默认 main）
-  --go-version VER      Linux 官方 tarball Go 版本（默认 ${GO_VERSION}）
+  --go-version VER      Linux 官方 tarball Go 版本
   --skip-docker         不安装/不检查 Docker
   --skip-clearance      不起 clearance
   --skip-browser        不装 Playwright/CloakBrowser
   --skip-go             不自动安装 Go
   --no-start-clearance  不 docker compose up
+  --yes / -y            非交互，全部默认
   -h, --help            帮助
 
 示例:
-  # Linux
   curl -fsSL .../install.sh | sudo bash
-  curl -fsSL .../install.sh | sudo bash -s -- --command grok-reg
-
-  # macOS（先装 brew + Docker Desktop）
+  curl -fsSL .../install.sh | sudo bash -s -- --command grok-reg --home /home/ubuntu/.grok
+  curl -fsSL .../install.sh | sudo NONINTERACTIVE=1 bash
+  # macOS
   curl -fsSL .../install.sh | bash
-  curl -fsSL .../install.sh | bash -s -- --command grok-reg --bin-dir "\$(brew --prefix)/bin"
 EOF
 }
 
@@ -123,12 +144,12 @@ die()  { printf '[x] %s\n' "$*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 while [ $# -gt 0 ]; do
   case "$1" in
-    --command) COMMAND_NAME="$2"; shift 2 ;;
-    --install-dir) INSTALL_DIR="$2"; shift 2 ;;
-    --home) GROK_HOME_OPT="$2"; shift 2 ;;
-    --bin-dir) BIN_DIR="$2"; shift 2 ;;
-    --share-dir) SHARE_DIR="$2"; shift 2 ;;
-    --venv-dir) VENV_DIR="$2"; shift 2 ;;
+    --command) COMMAND_NAME="$2"; SET_COMMAND=1; shift 2 ;;
+    --install-dir) INSTALL_DIR="$2"; SET_INSTALL_DIR=1; shift 2 ;;
+    --home) GROK_HOME_OPT="$2"; SET_HOME=1; shift 2 ;;
+    --bin-dir) BIN_DIR="$2"; SET_BIN_DIR=1; shift 2 ;;
+    --share-dir) SHARE_DIR="$2"; SET_SHARE_DIR=1; shift 2 ;;
+    --venv-dir) VENV_DIR="$2"; SET_VENV_DIR=1; shift 2 ;;
     --repo) REPO_URL="$2"; shift 2 ;;
     --branch) BRANCH="$2"; shift 2 ;;
     --go-version) GO_VERSION="$2"; shift 2 ;;
@@ -137,6 +158,7 @@ while [ $# -gt 0 ]; do
     --skip-browser) SKIP_BROWSER=1; shift ;;
     --skip-go) SKIP_GO_INSTALL=1; shift ;;
     --no-start-clearance) START_CLEARANCE=0; shift ;;
+    --yes|-y) NONINTERACTIVE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "未知参数: $1（--help 查看用法）" ;;
   esac
@@ -146,45 +168,129 @@ case "$COMMAND_NAME" in
   *[!a-zA-Z0-9._-]*|"") die "非法命令名: $COMMAND_NAME" ;;
 esac
 
-# 解析后补全 Linux 默认 GROK_HOME
-if [ "$OS" = "linux" ] && [ -z "$GROK_HOME_OPT" ]; then
-  if [ "$(id -u)" -eq 0 ]; then
+# ---------------------------------------------------------------------------
+# 真实调用用户（sudo 时用 SUDO_USER，避免 GROK_HOME 落到 /root）
+# ---------------------------------------------------------------------------
+REAL_USER="${SUDO_USER:-$(id -un)}"
+REAL_HOME="${HOME:-}"
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+  if command -v getent >/dev/null 2>&1; then
+    REAL_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+  fi
+  [ -z "$REAL_HOME" ] && REAL_HOME="/home/$SUDO_USER"
+elif [ -z "$REAL_HOME" ]; then
+  REAL_HOME="$(eval echo "~$REAL_USER" 2>/dev/null || echo "/root")"
+fi
+
+# Linux 默认 GROK_HOME：优先真实用户 home
+if [ "$OS" = "linux" ] && [ "$SET_HOME" != 1 ] && [ -z "$GROK_HOME_OPT" ]; then
+  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    GROK_HOME_OPT="${REAL_HOME}/.grok"
+  elif [ "$(id -u)" -eq 0 ]; then
     GROK_HOME_OPT="/root/.grok"
   else
-    GROK_HOME_OPT="${HOME:-/root}/.grok"
+    GROK_HOME_OPT="${HOME:-$REAL_HOME}/.grok"
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# 公共：写默认 config.env
+# 交互询问（/dev/tty，兼容 curl|sudo bash）
 # ---------------------------------------------------------------------------
-write_default_config() {
+prompt_value() {
+  # prompt_value VAR "说明" "默认"
+  local __var="$1" __msg="$2" __def="$3" __ans=""
+  if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+    printf -v "$__var" '%s' "$__def"
+    return 0
+  fi
+  printf '%s [%s]: ' "$__msg" "$__def" >/dev/tty
+  IFS= read -r __ans </dev/tty || true
+  if [ -z "${__ans}" ]; then
+    __ans="$__def"
+  fi
+  printf -v "$__var" '%s' "$__ans"
+}
+
+maybe_prompt_paths() {
+  if [ "$NONINTERACTIVE" = 1 ]; then
+    log "非交互模式：使用默认/参数路径"
+    return 0
+  fi
+  if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+    warn "无 TTY（常见于 curl|bash 无伪终端），使用默认路径；可用 --command / --install-dir / --home 覆盖"
+    return 0
+  fi
+
+  echo >/dev/tty
+  echo "==============================================" >/dev/tty
+  echo " 安装选项（直接回车 = 使用方括号内默认值）" >/dev/tty
+  echo "==============================================" >/dev/tty
+
+  if [ "$SET_COMMAND" != 1 ]; then
+    prompt_value COMMAND_NAME "CLI 命令名" "$COMMAND_NAME"
+    case "$COMMAND_NAME" in
+      *[!a-zA-Z0-9._-]*|"") die "非法命令名: $COMMAND_NAME" ;;
+    esac
+  fi
+  if [ "$SET_INSTALL_DIR" != 1 ]; then
+    prompt_value INSTALL_DIR "源码安装目录" "$INSTALL_DIR"
+  fi
+  if [ "$SET_HOME" != 1 ]; then
+    prompt_value GROK_HOME_OPT "数据目录 GROK_HOME" "$GROK_HOME_OPT"
+  fi
+  if [ "$SET_BIN_DIR" != 1 ]; then
+    prompt_value BIN_DIR "二进制目录" "$BIN_DIR"
+  fi
+  if [ "$SET_VENV_DIR" != 1 ]; then
+    prompt_value VENV_DIR "Python venv 目录" "$VENV_DIR"
+  fi
+  # share 默认跟 bin 同 PREFIX 语义：Linux /usr/local/share；已设则跳过
+  if [ "$SET_SHARE_DIR" != 1 ] && [ "$OS" = "linux" ]; then
+    :
+  fi
+
+  echo >/dev/tty
+  ok "将使用:"
+  echo "  命令:   $COMMAND_NAME" >/dev/tty
+  echo "  源码:   $INSTALL_DIR" >/dev/tty
+  echo "  数据:   $GROK_HOME_OPT" >/dev/tty
+  echo "  二进制: $BIN_DIR/$COMMAND_NAME" >/dev/tty
+  echo "  venv:   $VENV_DIR" >/dev/tty
+  echo >/dev/tty
+}
+
+maybe_prompt_paths
+
+# ---------------------------------------------------------------------------
+# 公共：从仓库 example 种子化 config.env（分区 + 中文注释）
+# ---------------------------------------------------------------------------
+seed_config_from_example() {
   local dest="$1"
-  cat >"$dest" <<EOF
-# 由 install.sh 生成 — 也可用 ${COMMAND_NAME} config 编辑
-# 完整说明见: ${GROK_HOME_OPT}/config.env.example
-
+  local example=""
+  if [ -f "$INSTALL_DIR/internal/config/example.env" ]; then
+    example="$INSTALL_DIR/internal/config/example.env"
+  elif [ -f "$INSTALL_DIR/config.env.example" ]; then
+    example="$INSTALL_DIR/config.env.example"
+  fi
+  if [ -z "$example" ]; then
+    warn "找不到 example 模板，写精简 config.env"
+    cat >"$dest" <<EOF
+# 由 install.sh 生成 — ${COMMAND_NAME} config 可编辑
 EMAIL_MODE=tempmail
-
 CLEARANCE_ENABLED=1
 REGISTER_PROXY=http://127.0.0.1:40080
 FLARESOLVERR_URL=http://127.0.0.1:8191
 CLEARANCE_PROXY=http://privoxy:8118
 CLEARANCE_URLS=https://accounts.x.ai,https://x.ai,https://status.x.ai,https://console.x.ai,https://auth.x.ai
-
 TURNSTILE_PROVIDER=browser
-
 PROTOCOL_HTTP=1
 HTTP_POOL_SIZE=8
 TEMPMAIL_LOL_RETRIES=30
 TEMPMAIL_LOL_MIN_INTERVAL_MS=1500
-
 HTTPS_PROXY=http://127.0.0.1:40080
 HTTP_PROXY=http://127.0.0.1:40080
 NO_PROXY=127.0.0.1,localhost
-
 PROBE_ENABLED=1
-
 CPA_UPLOAD_ENABLED=0
 CPA_MANAGEMENT_BASE=http://127.0.0.1:8317/v0/management
 CPA_MANAGEMENT_KEY=
@@ -194,6 +300,26 @@ CPA_UPLOAD_NAME_TEMPLATE={email}.json
 CPA_UPLOAD_VERIFY=1
 CPA_UPLOAD_MODE=multipart
 EOF
+    chmod 600 "$dest" 2>/dev/null || true
+    return 0
+  fi
+  # 复制完整分区中文模板，并统一 CPA 默认 host
+  cp -f "$example" "$dest"
+  # 确保 CPA_MANAGEMENT_BASE / KEY 存在
+  if ! grep -qE '^CPA_MANAGEMENT_BASE=' "$dest" 2>/dev/null; then
+    printf '\nCPA_MANAGEMENT_BASE=http://127.0.0.1:8317/v0/management\n' >>"$dest"
+  else
+    # localhost → 127.0.0.1（与文档一致）
+    sed -i.bak 's#^CPA_MANAGEMENT_BASE=http://localhost:#CPA_MANAGEMENT_BASE=http://127.0.0.1:#' "$dest" 2>/dev/null || \
+      sed -i '' 's#^CPA_MANAGEMENT_BASE=http://localhost:#CPA_MANAGEMENT_BASE=http://127.0.0.1:#' "$dest" 2>/dev/null || true
+    rm -f "${dest}.bak" 2>/dev/null || true
+  fi
+  if ! grep -qE '^CPA_MANAGEMENT_KEY=' "$dest" 2>/dev/null; then
+    # 模板里已有 KEY= 行
+    if ! grep -q 'CPA_MANAGEMENT_KEY=' "$dest" 2>/dev/null; then
+      printf 'CPA_MANAGEMENT_KEY=\n' >>"$dest"
+    fi
+  fi
   chmod 600 "$dest" 2>/dev/null || true
 }
 
@@ -218,7 +344,6 @@ sync_repo() {
 build_and_install_cli() {
   log "编译并安装 CLI → $BIN_DIR/$COMMAND_NAME"
   export PATH="${PATH}:/usr/local/go/bin"
-  # Homebrew Go
   if [ "$OS" = "darwin" ] && command -v brew >/dev/null 2>&1; then
     export PATH="$(brew --prefix)/bin:$(brew --prefix)/opt/go/bin:${PATH}"
   fi
@@ -244,10 +369,14 @@ install_browser() {
   python3 -m venv "$VENV_DIR"
   "${VENV_DIR}/bin/pip" install -U pip
   "${VENV_DIR}/bin/pip" install -r "$INSTALL_DIR/scripts/requirements-turnstile.txt"
-  # CloakBrowser 装到当前用户 home
-  HOME="${HOME:-/root}" "${VENV_DIR}/bin/python" -m cloakbrowser install || \
-    "${VENV_DIR}/bin/python" -m cloakbrowser install
-  ok "浏览器依赖就绪"
+  local cb_home="${HOME:-/root}"
+  # sudo 安装时浏览器装到真实用户 home，避免 root-only
+  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    cb_home="$REAL_HOME"
+  fi
+  HOME="$cb_home" "${VENV_DIR}/bin/python" -m cloakbrowser install || \
+    HOME="$cb_home" "${VENV_DIR}/bin/python" -m cloakbrowser install
+  ok "浏览器依赖就绪 (CloakBrowser home=$cb_home)"
 }
 
 start_clearance() {
@@ -260,7 +389,7 @@ start_clearance() {
     return 0
   fi
   if ! docker info >/dev/null 2>&1; then
-    warn "Docker 未运行，跳过 clearance；请启动后执行: cd $INSTALL_DIR/clearance && docker compose up -d"
+    warn "Docker 未运行，跳过 clearance；请启动后: cd $INSTALL_DIR/clearance && docker compose up -d"
     return 0
   fi
   log "启动 clearance 清障栈..."
@@ -268,6 +397,22 @@ start_clearance() {
     (cd "$INSTALL_DIR/clearance" && docker compose up -d) || \
       warn "clearance 启动失败，可稍后: cd $INSTALL_DIR/clearance && docker compose up -d"
     (cd "$INSTALL_DIR/clearance" && docker compose ps) || true
+  fi
+}
+
+chown_if_sudo_user() {
+  # 数据/venv 属主改回 SUDO_USER，便于普通用户 grok start
+  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    local grp
+    grp="$(id -gn "$SUDO_USER" 2>/dev/null || echo "$SUDO_USER")"
+    chown -R "${SUDO_USER}:${grp}" "$GROK_HOME_OPT" 2>/dev/null || true
+    # venv 若在 /opt 保持 root 可执行即可；若在用户目录则 chown
+    case "$VENV_DIR" in
+      /home/*|"$REAL_HOME"/*) chown -R "${SUDO_USER}:${grp}" "$VENV_DIR" 2>/dev/null || true ;;
+    esac
+    case "$INSTALL_DIR" in
+      /home/*|"$REAL_HOME"/*) chown -R "${SUDO_USER}:${grp}" "$INSTALL_DIR" 2>/dev/null || true ;;
+    esac
   fi
 }
 
@@ -283,11 +428,12 @@ prepare_data_dir() {
   fi
 
   if [ ! -f "$GROK_HOME_OPT/config.env" ]; then
-    log "写入默认 config.env（EMAIL_MODE=tempmail）"
-    write_default_config "$GROK_HOME_OPT/config.env"
+    log "写入分区中文 config.env（完整模板）"
+    seed_config_from_example "$GROK_HOME_OPT/config.env"
   else
     ok "保留已有 config.env"
   fi
+  chown_if_sudo_user
 }
 
 print_done() {
@@ -308,26 +454,28 @@ print_done() {
   echo "  配置:     ${GROK_HOME_OPT}/config.env"
   echo "  示例:     ${GROK_HOME_OPT}/config.env.example"
   echo "  环境:     ${env_hint}"
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    echo
+    echo "  注意: 请用用户 ${SUDO_USER} 运行（不要长期 root）："
+    echo "    export GROK_HOME=${GROK_HOME_OPT}"
+    echo "    export GROK_PYTHON=${VENV_DIR}/bin/python"
+  fi
   echo
   echo "快速开始:"
   echo "  export PATH=\"\$PATH:${BIN_DIR}\""
   echo "  export GROK_HOME=${GROK_HOME_OPT}"
   echo "  export GROK_PYTHON=${VENV_DIR}/bin/python"
+  echo "  ${COMMAND_NAME} config              # 编辑配置（分区中文）"
   echo "  ${COMMAND_NAME} start"
-  echo "  ${COMMAND_NAME} start -t 10 --thread 2"
+  echo "  ${COMMAND_NAME} start -t 1 --thread 1   # 低配机请用 1 线程"
   echo "  ${COMMAND_NAME} status"
   echo "  ${COMMAND_NAME} logs -f"
-  echo "  ${COMMAND_NAME} config"
   echo
   if [ "$COMMAND_NAME" != "grok" ]; then
     echo "提示: 命令名为 ${COMMAND_NAME}（不是 grok）。"
   fi
-  if [ "$OS" = "darwin" ]; then
-    echo "macOS: 请确认 Docker Desktop 已打开；clearance 异常时:"
-  else
-    echo "若 clearance 未 healthy:"
-  fi
-  echo "  cd ${INSTALL_DIR}/clearance && docker compose up -d && docker compose ps"
+  echo "硬件提示: 清障栈+1 浏览器约需 2GB+ RAM；1GB 机器务必 --thread 1 且保证 swap。"
+  echo "clearance: cd ${INSTALL_DIR}/clearance && docker compose up -d && docker compose ps"
   echo
   if [ -x "${BIN_DIR}/${COMMAND_NAME}" ]; then
     "${BIN_DIR}/${COMMAND_NAME}" help 2>/dev/null || true
@@ -335,12 +483,11 @@ print_done() {
 }
 
 # ===========================================================================
-# Linux: Debian/Ubuntu + root
+# Linux
 # ===========================================================================
 install_linux() {
   if [ "$(id -u)" -ne 0 ]; then
     if command -v sudo >/dev/null 2>&1; then
-      # curl|bash 时 $0 可能是 bash，优先用 BASH_SOURCE
       local self="${BASH_SOURCE[0]:-}"
       if [ -n "$self" ] && [ -f "$self" ]; then
         log "需要 root，通过 sudo 重新执行..."
@@ -359,6 +506,7 @@ install_linux() {
           SKIP_BROWSER="$SKIP_BROWSER" \
           SKIP_GO_INSTALL="$SKIP_GO_INSTALL" \
           START_CLEARANCE="$START_CLEARANCE" \
+          NONINTERACTIVE="$NONINTERACTIVE" \
           bash "$self" \
           --command "$COMMAND_NAME" \
           --install-dir "$INSTALL_DIR" \
@@ -373,7 +521,8 @@ install_linux() {
           $([ "$SKIP_CLEARANCE" = 1 ] && echo --skip-clearance) \
           $([ "$SKIP_BROWSER" = 1 ] && echo --skip-browser) \
           $([ "$SKIP_GO_INSTALL" = 1 ] && echo --skip-go) \
-          $([ "$START_CLEARANCE" = 0 ] && echo --no-start-clearance)
+          $([ "$START_CLEARANCE" = 0 ] && echo --no-start-clearance) \
+          $([ "$NONINTERACTIVE" = 1 ] && echo --yes)
       fi
       die "请使用: curl -fsSL .../install.sh | sudo bash"
     fi
@@ -382,7 +531,12 @@ install_linux() {
 
   export DEBIAN_FRONTEND=noninteractive
   export PATH="${PATH}:/usr/local/go/bin"
-  export HOME="${HOME:-/root}"
+  # cloakbrowser 等：优先真实用户 home
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    export HOME="$REAL_HOME"
+  else
+    export HOME="${HOME:-/root}"
+  fi
 
   if [ ! -f /etc/os-release ]; then
     die "仅支持 Debian/Ubuntu（需要 /etc/os-release）"
@@ -393,6 +547,16 @@ install_linux() {
     debian|ubuntu) ;;
     *) warn "未识别发行版 ID=${ID:-?}，将按 Debian/Ubuntu 继续尝试" ;;
   esac
+
+  # 低配内存提示
+  if [ -r /proc/meminfo ]; then
+    local mem_kb
+    mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if [ "${mem_kb:-0}" -gt 0 ] && [ "$mem_kb" -lt 1800000 ]; then
+      warn "检测到内存约 $((mem_kb/1024))MiB：建议 ≥2GiB 才能顺畅跑浏览器+清障"
+      warn "请始终: ${COMMAND_NAME} start -t N --thread 1 ，并确保有 2G+ swap"
+    fi
+  fi
 
   echo
   echo "=============================================="
@@ -405,6 +569,7 @@ install_linux() {
   echo "  脚本共享:   $SHARE_DIR"
   echo "  Python venv:$VENV_DIR"
   echo "  仓库:       $REPO_URL ($BRANCH)"
+  echo "  运行用户:   ${SUDO_USER:-root}"
   echo "=============================================="
   echo
 
@@ -425,7 +590,6 @@ install_linux() {
     || warn "部分包安装失败，可稍后手动补齐"
   ok "系统依赖就绪"
 
-  # Go
   need_go=0
   if ! command -v go >/dev/null 2>&1; then
     need_go=1
@@ -450,7 +614,6 @@ install_linux() {
     ok "使用已有 Go: $(go version)"
   fi
 
-  # Docker
   if [ "$SKIP_DOCKER" != 1 ]; then
     if ! command -v docker >/dev/null 2>&1; then
       log "安装 Docker..."
@@ -463,6 +626,10 @@ install_linux() {
       log "安装 docker compose plugin..."
       apt-get install -y docker-compose-plugin 2>/dev/null || true
     fi
+    # 允许 SUDO_USER 用 docker
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+      usermod -aG docker "$SUDO_USER" 2>/dev/null || true
+    fi
     ok "Docker: $(docker --version 2>/dev/null || echo '?')"
   else
     warn "已跳过 Docker"
@@ -470,8 +637,7 @@ install_linux() {
 
   sync_repo
   build_and_install_cli
-  # root 下 CloakBrowser 装到 /root
-  HOME=/root install_browser
+  install_browser
   start_clearance
   prepare_data_dir
 
@@ -487,7 +653,27 @@ export CLOAKBROWSER_SUPPRESS_FONT_WARNING=1
 EOF
   chmod 644 "$PROFILE_SNIPPET"
 
-  if [ -f /root/.bashrc ] && ! grep -q 'GROK_HOME=' /root/.bashrc 2>/dev/null; then
+  # 写入真实用户 bashrc / zshrc
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    for rc in "${REAL_HOME}/.bashrc" "${REAL_HOME}/.zshrc" "${REAL_HOME}/.profile"; do
+      [ -d "$(dirname "$rc")" ] || continue
+      touch "$rc" 2>/dev/null || continue
+      if ! grep -q 'Grok-Register (generated by install.sh)' "$rc" 2>/dev/null; then
+        {
+          echo ""
+          echo "# Grok-Register (generated by install.sh)"
+          echo "export GROK_HOME=\"${GROK_HOME_OPT}\""
+          echo "export GROK_PYTHON=\"${VENV_DIR}/bin/python\""
+          echo "export GROK_TURNSTILE_SCRIPT=\"${SHARE_DIR}/turnstile_mint.py\""
+          echo "export GROK_TURNSTILE_POOL_SCRIPT=\"${SHARE_DIR}/turnstile_pool.py\""
+          echo "export CLOAKBROWSER_SUPPRESS_FONT_WARNING=1"
+          echo "export PATH=\"\$PATH:${BIN_DIR}\""
+        } >>"$rc"
+        chown "${SUDO_USER}:$(id -gn "$SUDO_USER" 2>/dev/null || echo "$SUDO_USER")" "$rc" 2>/dev/null || true
+        ok "已写入环境: $rc"
+      fi
+    done
+  elif [ -f /root/.bashrc ] && ! grep -q 'GROK_HOME=' /root/.bashrc 2>/dev/null; then
     {
       echo ""
       echo "# Grok-Register"
@@ -503,10 +689,9 @@ EOF
 }
 
 # ===========================================================================
-# macOS: 依赖已装 Homebrew + Docker Desktop
+# macOS
 # ===========================================================================
 install_darwin() {
-  # 不强制 root；若误用 sudo，HOME 可能变成 /var/root，给出警告
   if [ "$(id -u)" -eq 0 ]; then
     warn "检测到 root 运行。macOS 建议用普通用户: curl ... | bash（不要 sudo）"
   fi
@@ -527,7 +712,6 @@ install_darwin() {
   echo "=============================================="
   echo
 
-  # --- 前置：Homebrew ---
   if ! command -v brew >/dev/null 2>&1; then
     cat >&2 <<'EOM'
 [x] 未检测到 Homebrew。
@@ -535,8 +719,6 @@ install_darwin() {
 请先安装 Homebrew，然后重新运行本脚本：
 
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-安装完成后按提示把 brew 加入 PATH（Apple Silicon 常见）：
 
   echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
   eval "$(/opt/homebrew/bin/brew shellenv)"
@@ -549,21 +731,14 @@ EOM
   eval "$("$(command -v brew)" shellenv)" 2>/dev/null || true
   export PATH="$(brew --prefix)/bin:$(brew --prefix)/sbin:${PATH}"
 
-  # --- 前置：Docker Desktop ---
   if [ "$SKIP_DOCKER" != 1 ]; then
     if ! command -v docker >/dev/null 2>&1; then
       cat >&2 <<'EOM'
 [x] 未检测到 docker 命令。
 
-请先安装并启动 Docker Desktop，然后重新运行本脚本：
-
   brew install --cask docker
-
-  # 或从官网安装:
-  # https://www.docker.com/products/docker-desktop/
-
-安装后打开「Docker」应用，等待菜单栏鲸鱼图标就绪，再执行：
-
+  # 或 https://www.docker.com/products/docker-desktop/
+  open -a Docker
   docker info
   curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scripts/install.sh | bash
 EOM
@@ -571,28 +746,19 @@ EOM
     fi
     if ! docker info >/dev/null 2>&1; then
       cat >&2 <<'EOM'
-[x] Docker 已安装但未运行（docker info 失败）。
-
-请打开 Docker Desktop，等待引擎启动后再跑：
+[x] Docker 已安装但未运行。
 
   open -a Docker
-  # 就绪后:
-  docker info
-  curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scripts/install.sh | bash
-
-若暂时不需要清障栈，可跳过检查：
-
-  curl -fsSL .../install.sh | bash -s -- --skip-docker --skip-clearance
+  # 就绪后重跑 install.sh
+  # 或: bash -s -- --skip-docker --skip-clearance
 EOM
       exit 1
     fi
     ok "Docker: $(docker --version 2>/dev/null || true)"
-    docker compose version >/dev/null 2>&1 || warn "docker compose 不可用，清障栈可能无法启动"
   else
     warn "已跳过 Docker 检查"
   fi
 
-  # --- brew 依赖 ---
   log "通过 Homebrew 安装/确认依赖 (git make go python)..."
   local pkgs=()
   command -v git >/dev/null 2>&1 || pkgs+=(git)
@@ -601,7 +767,6 @@ EOM
     if ! command -v go >/dev/null 2>&1; then
       pkgs+=(go)
     elif ! go version 2>/dev/null | grep -qE 'go1\.(2[1-9]|[3-9][0-9])'; then
-      warn "Go 版本偏旧: $(go version 2>/dev/null || true)，将 brew install go"
       pkgs+=(go)
     fi
   fi
@@ -612,25 +777,17 @@ EOM
     log "brew install ${pkgs[*]}"
     brew install "${pkgs[@]}"
   fi
-  if ! command -v go >/dev/null 2>&1; then
-    if [ "$SKIP_GO_INSTALL" = 1 ]; then
-      die "无 go 且指定了 --skip-go"
-    fi
-    die "仍找不到 go，请手动: brew install go"
-  fi
+  command -v go >/dev/null 2>&1 || die "仍找不到 go，请: brew install go"
   ok "Go: $(go version)"
   ok "Python: $(python3 --version 2>/dev/null || true)"
 
-  # 确保 bin 目录在 PATH（~/.local/bin 可能尚未存在）
   mkdir -p "$BIN_DIR" "$SHARE_DIR"
-
   sync_repo
   build_and_install_cli
   install_browser
   start_clearance
   prepare_data_dir
 
-  # shell 环境：~/.zprofile + ~/.zshrc（mac 默认 zsh）
   local marker="# Grok-Register (generated by install.sh)"
   local block
   block=$(cat <<EOF
@@ -645,37 +802,20 @@ EOF
 )
   local env_hint=""
   for rc in "${HOME}/.zprofile" "${HOME}/.zshrc" "${HOME}/.bash_profile"; do
-    case "$rc" in
-      *.bash_profile) [ -f "${HOME}/.bashrc" ] || [ -f "$rc" ] || continue ;;
-    esac
-    touch "$rc"
+    touch "$rc" 2>/dev/null || continue
     if grep -q 'Grok-Register (generated by install.sh)' "$rc" 2>/dev/null; then
-      # 粗暴刷新：删旧块再追加（按 marker 到下一空行前较难，直接提示用户 source）
-      ok "已存在环境片段: $rc（若路径变更请手动改）"
+      ok "已存在环境片段: $rc"
     else
       printf '\n%s\n' "$block" >>"$rc"
       ok "已写入环境: $rc"
     fi
     env_hint="${env_hint:+$env_hint, }$rc"
   done
-  # 至少保证 zprofile
-  if [ -z "$env_hint" ]; then
-    printf '%s\n' "$block" >>"${HOME}/.zprofile"
-    env_hint="${HOME}/.zprofile"
-  fi
-
-  # PATH 提示
-  case ":$PATH:" in
-    *":${BIN_DIR}:"*) ;;
-    *) warn "当前 shell 的 PATH 尚无 ${BIN_DIR}，请执行: export PATH=\"\$PATH:${BIN_DIR}\" 或新开终端" ;;
-  esac
+  [ -n "$env_hint" ] || env_hint="${HOME}/.zprofile"
 
   print_done "$env_hint"
 }
 
-# ---------------------------------------------------------------------------
-# 入口
-# ---------------------------------------------------------------------------
 case "$OS" in
   linux)  install_linux ;;
   darwin) install_darwin ;;
