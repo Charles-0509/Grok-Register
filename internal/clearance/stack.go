@@ -8,9 +8,75 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
+
+// Default Privoxy images: vimagick 无 arm 多架构清单，arm64 用 lusky3。
+const (
+	privoxyImageAMD64 = "vimagick/privoxy:latest"
+	privoxyImageARM64 = "lusky3/privoxy:latest"
+)
+
+// DefaultPrivoxyImage returns the arch-appropriate Privoxy image.
+// PRIVOXY_IMAGE env overrides when set.
+func DefaultPrivoxyImage() string {
+	if v := strings.TrimSpace(os.Getenv("PRIVOXY_IMAGE")); v != "" {
+		return v
+	}
+	switch runtime.GOARCH {
+	case "arm64", "arm":
+		return privoxyImageARM64
+	default:
+		// amd64, 386, etc.
+		return privoxyImageAMD64
+	}
+}
+
+// ensurePrivoxyImageEnv sets PRIVOXY_IMAGE for compose (and writes clearance/.env
+// so bare `docker compose up` on this host keeps the same image).
+func ensurePrivoxyImageEnv(composeDir string) {
+	img := DefaultPrivoxyImage()
+	_ = os.Setenv("PRIVOXY_IMAGE", img)
+	if composeDir == "" {
+		return
+	}
+	envPath := filepath.Join(composeDir, ".env")
+	body := ""
+	if data, err := os.ReadFile(envPath); err == nil {
+		body = string(data)
+	}
+	lines := strings.Split(body, "\n")
+	found := false
+	out := make([]string, 0, len(lines)+2)
+	for _, line := range lines {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, "PRIVOXY_IMAGE=") {
+			if !found {
+				out = append(out, "PRIVOXY_IMAGE="+img)
+				found = true
+			}
+			continue
+		}
+		out = append(out, line)
+	}
+	// drop trailing empty lines from split of empty file
+	for len(out) > 0 && out[len(out)-1] == "" {
+		out = out[:len(out)-1]
+	}
+	if !found {
+		if len(out) > 0 {
+			out = append(out, "")
+		}
+		out = append(out,
+			"# auto: host arch privoxy image (override with PRIVOXY_IMAGE)",
+			"PRIVOXY_IMAGE="+img,
+		)
+	}
+	text := strings.Join(out, "\n") + "\n"
+	_ = os.WriteFile(envPath, []byte(text), 0o644)
+}
 
 // Project containers from clearance/docker-compose.yml
 var stackContainerNames = []string{
@@ -91,9 +157,12 @@ func dockerAvailable() error {
 }
 
 func composeCmd(dir string, args ...string) *exec.Cmd {
+	ensurePrivoxyImageEnv(dir)
 	all := append([]string{"compose"}, args...)
 	cmd := exec.Command("docker", all...)
 	cmd.Dir = dir
+	// Ensure child sees PRIVOXY_IMAGE even if parent only Setenv'd above.
+	cmd.Env = append(os.Environ(), "PRIVOXY_IMAGE="+DefaultPrivoxyImage())
 	return cmd
 }
 
@@ -163,7 +232,7 @@ func EnsureStack(composeDir string, privoxyPort, flaresolverrPort int) (string, 
 	var last string
 	for time.Now().Before(deadline) {
 		if portOpen("127.0.0.1", privoxyPort) && httpOK(fmt.Sprintf("http://127.0.0.1:%d/", flaresolverrPort), 3*time.Second) {
-			return fmt.Sprintf("清障栈已就绪 dir=%s", dir), nil
+			return fmt.Sprintf("清障栈已就绪 dir=%s privoxy=%s", dir, DefaultPrivoxyImage()), nil
 		}
 		last = "等待 privoxy/flaresolverr 端口..."
 		time.Sleep(2 * time.Second)

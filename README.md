@@ -195,6 +195,9 @@ clearance：
 cd /opt/Grok-Register/clearance && docker compose up -d && docker compose ps
 # macOS
 cd ~/Grok-Register/clearance && docker compose up -d && docker compose ps
+# Privoxy 镜像按架构自动选（也可 export PRIVOXY_IMAGE=... 覆盖）:
+#   amd64  → vimagick/privoxy:latest
+#   arm64  → lusky3/privoxy:latest（vimagick 无 arm）
 ```
 
 ---
@@ -325,6 +328,10 @@ echo exit:$?
 
 ```bash
 cd /opt/Grok-Register/clearance
+# Privoxy 按 CPU 架构选镜像（可 export PRIVOXY_IMAGE= 覆盖）
+#   amd64/x86_64 → vimagick/privoxy:latest
+#   arm64/aarch64 → lusky3/privoxy:latest（vimagick 无 arm）
+# install.sh / grok 拉栈时会写入 clearance/.env
 sudo docker compose up -d
 sudo docker compose ps
 ```
@@ -579,11 +586,26 @@ export PATH=$PATH:/usr/local/go/bin
 make build && sudo make install
 ```
 
+**`Missing X server or $DISPLAY` / `TargetClosedError`（offscreen 启动失败）**
+
+默认 `TURNSTILE_MODE=offscreen` 是**有头** Chromium 移到屏外，无图形桌面时必须装虚拟显示：
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install -y xvfb
+# 重新编译安装 grok 后：无 $DISPLAY 时会自动用 xvfb-run 包一层
+cd /opt/Grok-Register && sudo make install   # 或重新跑 install.sh
+grok stop; grok start
+```
+
+启动日志应出现 `Turnstile display=xvfb-run (no $DISPLAY)`。临时绕过（易 600010）：`TURNSTILE_MODE=headless`。
+
 **`turnstile timeout` / `iframes=0`**
 
 1. `GROK_PYTHON` 指向已装 playwright 的 venv  
 2. `python -m cloakbrowser install` 已完成  
 3. clearance healthy，`REGISTER_PROXY` 可用  
+4. 若日志含 Missing X server，先按上一节装 xvfb
 
 **`lookup cli-proxy-api: no such host`**
 

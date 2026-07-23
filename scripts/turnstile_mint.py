@@ -96,6 +96,23 @@ def launch_args(mode: str) -> list[str]:
     return args
 
 
+def require_display(mode: str) -> None:
+    """Headed offscreen needs X11; Go normally wraps with xvfb-run when missing."""
+    m = (mode or "offscreen").strip().lower()
+    if m in ("", "auto"):
+        m = "offscreen"
+    if m == "headless":
+        return
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return
+    raise RuntimeError(
+        "Missing X server / $DISPLAY for TURNSTILE_MODE=offscreen. "
+        "Install xvfb and re-run via grok (auto xvfb-run), or: "
+        "apt-get install -y xvfb && xvfb-run -a <this script ...>; "
+        "or set TURNSTILE_MODE=headless (often CF 600010)."
+    )
+
+
 async def mint(
     site_key: str,
     page_url: str,
@@ -111,6 +128,7 @@ async def mint(
     mode = (mode or "offscreen").strip().lower()
     if mode in ("", "auto"):
         mode = "offscreen"
+    require_display(mode)
     use_headless = mode == "headless"
 
     launch: dict = {

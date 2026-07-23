@@ -95,7 +95,11 @@ func (p *PlaywrightBridge) Solve(ctx context.Context, siteKey, pageURL string) (
 	}
 	args = append(args, "--mode", mode)
 
-	cmd := exec.CommandContext(ctx, p.Python, args...)
+	bin, fullArgs, errWrap := wrapForDisplay(mode, p.Python, args)
+	if errWrap != nil {
+		return "", errWrap
+	}
+	cmd := exec.CommandContext(ctx, bin, fullArgs...)
 	// inherit solver knobs
 	cmd.Env = os.Environ()
 	var stdout, stderr bytes.Buffer

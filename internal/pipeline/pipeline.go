@@ -281,6 +281,7 @@ func (e *Engine) run(ctx context.Context) error {
 		defer c.Close()
 	}
 	log.Infof("Turnstile provider=%s mode=%s workers=%d (pool → one-shot → chromedp)", e.turn.Name(), tsMode, sWorkers)
+	log.Infof("Turnstile display=%s", turnstile.DisplayHint(tsMode))
 	log.Infof("Turnstile mint: python=%s pool=%s script=%s", turnstile.DetectedPython(), turnstile.DetectedPoolScript(), turnstile.DetectedScript())
 	e.uploader = cpa.NewUploader(cpa.UploadConfig{
 		Enabled:      cfg.CPAUploadEnabled,
