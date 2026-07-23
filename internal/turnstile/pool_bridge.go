@@ -111,7 +111,8 @@ func (p *PoolBridge) start(ctx context.Context) error {
 		mode = "offscreen"
 	}
 	args = append(args, "--mode", mode)
-	cmd := exec.Command(p.Python, args...)
+	bin, binArgs := maybeXvfb(p.Python, args, mode)
+	cmd := exec.Command(bin, binArgs...)
 	cmd.Env = os.Environ()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

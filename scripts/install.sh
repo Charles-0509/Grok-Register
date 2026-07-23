@@ -883,6 +883,7 @@ install_linux() {
     libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
     libxrandr2 libgbm1 "$ALSA_PKG" libpango-1.0-0 libcairo2 \
     fonts-liberation fonts-noto-cjk \
+    xvfb \
     || warn "部分包安装失败，可稍后手动补齐"
   ok "系统依赖就绪"
 

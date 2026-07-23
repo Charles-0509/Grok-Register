@@ -59,7 +59,31 @@ def emit(obj: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def launch_args(mode: str) -> list[str]:
+def has_display() -> bool:
+    return bool(
+        (os.environ.get("DISPLAY") or "").strip()
+        or (os.environ.get("WAYLAND_DISPLAY") or "").strip()
+    )
+
+
+def resolve_launch_mode(mode: str) -> tuple[str, bool]:
+    """Return (label, headless). See turnstile_mint.resolve_launch_mode."""
+    mode = (mode or "offscreen").strip().lower()
+    if mode in ("", "auto"):
+        mode = "offscreen"
+    if mode == "headless":
+        return "headless", True
+    if has_display():
+        return "offscreen", False
+    print(
+        "warn: TURNSTILE_MODE=offscreen but no $DISPLAY; using headless fallback. "
+        "Install xvfb for true offscreen: apt install -y xvfb",
+        file=sys.stderr,
+    )
+    return "headless-no-display", True
+
+
+def launch_args(label: str) -> list[str]:
     args = [
         "--no-sandbox",
         "--disable-blink-features=AutomationControlled",
@@ -68,7 +92,7 @@ def launch_args(mode: str) -> list[str]:
         "--disable-infobars",
         "--disable-dev-shm-usage",
     ]
-    if mode in ("", "auto", "offscreen"):
+    if label == "offscreen":
         args.extend(["--window-position=-32000,-32000", "--window-size=800,600"])
     return args
 
@@ -90,11 +114,11 @@ class Slot:
             return
         from playwright.async_api import async_playwright
 
-        use_headless = self.mode == "headless"
+        label, use_headless = resolve_launch_mode(self.mode)
         launch: dict = {
             "executable_path": self.chrome,
             "headless": use_headless,
-            "args": launch_args(self.mode),
+            "args": launch_args(label),
         }
         if self.proxy:
             launch["proxy"] = {"server": self.proxy}

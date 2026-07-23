@@ -95,7 +95,8 @@ func (p *PlaywrightBridge) Solve(ctx context.Context, siteKey, pageURL string) (
 	}
 	args = append(args, "--mode", mode)
 
-	cmd := exec.CommandContext(ctx, p.Python, args...)
+	bin, binArgs := maybeXvfb(p.Python, args, mode)
+	cmd := exec.CommandContext(ctx, bin, binArgs...)
 	// inherit solver knobs
 	cmd.Env = os.Environ()
 	var stdout, stderr bytes.Buffer
@@ -123,6 +124,34 @@ func (p *PlaywrightBridge) Solve(ctx context.Context, siteKey, pageURL string) (
 // DetectedPython / DetectedScript expose resolved mint paths for startup logs.
 func DetectedPython() string { return findPython() }
 func DetectedScript() string { return findMintScript() }
+
+// maybeXvfb wraps python with xvfb-run when offscreen is requested and no DISPLAY.
+// Lets headed Chromium run under a virtual framebuffer on headless servers.
+func maybeXvfb(python string, args []string, mode string) (string, []string) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" || mode == "auto" {
+		mode = "offscreen"
+	}
+	if mode == "headless" {
+		return python, args
+	}
+	if strings.TrimSpace(os.Getenv("DISPLAY")) != "" || strings.TrimSpace(os.Getenv("WAYLAND_DISPLAY")) != "" {
+		return python, args
+	}
+	// explicit opt-out
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("GROK_TURNSTILE_NO_XVFB")))
+	if v == "1" || v == "true" || v == "yes" {
+		return python, args
+	}
+	xvfb, err := exec.LookPath("xvfb-run")
+	if err != nil {
+		return python, args
+	}
+	// xvfb-run -a python script.py ...
+	out := []string{"-a", python}
+	out = append(out, args...)
+	return xvfb, out
+}
 
 func injectClearance() bool {
 	v := strings.TrimSpace(strings.ToLower(os.Getenv("GROK_TURNSTILE_INJECT_CLEARANCE")))

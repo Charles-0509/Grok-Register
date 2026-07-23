@@ -76,7 +76,38 @@ def parse_cookie_header(raw: str) -> list[dict]:
     return out
 
 
-def launch_args(mode: str) -> list[str]:
+def has_display() -> bool:
+    return bool(
+        (os.environ.get("DISPLAY") or "").strip()
+        or (os.environ.get("WAYLAND_DISPLAY") or "").strip()
+    )
+
+
+def resolve_launch_mode(mode: str) -> tuple[str, bool]:
+    """Return (label, headless).
+
+    offscreen prefers headed+window off-screen when a display exists (incl. Xvfb).
+    On bare Linux servers without DISPLAY, fall back to headless so launch works
+    (may be weaker vs Turnstile; install xvfb and re-run with DISPLAY for offscreen).
+    """
+    mode = (mode or "offscreen").strip().lower()
+    if mode in ("", "auto"):
+        mode = "offscreen"
+    if mode == "headless":
+        return "headless", True
+    if has_display():
+        return "offscreen", False
+    print(
+        "warn: TURNSTILE_MODE=offscreen but no $DISPLAY; "
+        "using headless fallback. For true offscreen on servers: "
+        "apt install xvfb && (export DISPLAY=:99; Xvfb :99 -screen 0 1280x720x24 &) "
+        "or: xvfb-run -a grok start ...",
+        file=sys.stderr,
+    )
+    return "headless-no-display", True
+
+
+def launch_args(label: str) -> list[str]:
     args = [
         "--no-sandbox",
         "--disable-blink-features=AutomationControlled",
@@ -86,7 +117,7 @@ def launch_args(mode: str) -> list[str]:
         "--disable-dev-shm-usage",
     ]
     # offscreen: headed browser moved off-screen (true headless often gets Turnstile 600010)
-    if mode in ("", "auto", "offscreen"):
+    if label == "offscreen":
         args.extend(
             [
                 "--window-position=-32000,-32000",
@@ -108,15 +139,12 @@ async def mint(
 ) -> str:
     from playwright.async_api import async_playwright
 
-    mode = (mode or "offscreen").strip().lower()
-    if mode in ("", "auto"):
-        mode = "offscreen"
-    use_headless = mode == "headless"
+    label, use_headless = resolve_launch_mode(mode)
 
     launch: dict = {
         "executable_path": chrome,
         "headless": use_headless,
-        "args": launch_args(mode),
+        "args": launch_args(label),
     }
     if proxy:
         # Playwright accepts {"server": "http://..."}
