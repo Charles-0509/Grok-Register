@@ -654,6 +654,49 @@ install_browser() {
   ok "浏览器依赖就绪 (CloakBrowser home=$cb_home)"
 }
 
+# Privoxy 镜像：vimagick 无 arm；arm64/aarch64 用 lusky3（可被 PRIVOXY_IMAGE 覆盖）
+resolve_privoxy_image() {
+  if [ -n "${PRIVOXY_IMAGE:-}" ]; then
+    printf '%s\n' "$PRIVOXY_IMAGE"
+    return 0
+  fi
+  case "${ARCH:-$(uname -m)}" in
+    aarch64|arm64|armv7l|armv6l|armhf)
+      printf '%s\n' "lusky3/privoxy:latest"
+      ;;
+    *)
+      printf '%s\n' "vimagick/privoxy:latest"
+      ;;
+  esac
+}
+
+write_clearance_env() {
+  # 写入 clearance/.env，手动 docker compose 也能选对镜像
+  local dir="${1:-}"
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  local img
+  img="$(resolve_privoxy_image)"
+  export PRIVOXY_IMAGE="$img"
+  local envf="$dir/.env"
+  if [ -f "$envf" ] && grep -qE '^PRIVOXY_IMAGE=' "$envf" 2>/dev/null; then
+    # 就地替换
+    if command -v sed >/dev/null 2>&1; then
+      sed -i.bak -E "s|^PRIVOXY_IMAGE=.*|PRIVOXY_IMAGE=${img}|" "$envf" 2>/dev/null || \
+        printf 'PRIVOXY_IMAGE=%s\n' "$img" >"$envf"
+      rm -f "${envf}.bak" 2>/dev/null || true
+    else
+      printf 'PRIVOXY_IMAGE=%s\n' "$img" >"$envf"
+    fi
+  else
+    {
+      if [ -f "$envf" ]; then cat "$envf"; fi
+      echo "# auto: host arch privoxy image (override with PRIVOXY_IMAGE)"
+      echo "PRIVOXY_IMAGE=${img}"
+    } >"${envf}.tmp" && mv "${envf}.tmp" "$envf"
+  fi
+  log "Privoxy 镜像 (${ARCH:-$(uname -m)}): $img"
+}
+
 start_clearance() {
   if [ "$SKIP_CLEARANCE" = 1 ] || [ "$SKIP_DOCKER" = 1 ] || [ "$START_CLEARANCE" != 1 ]; then
     warn "未启动 clearance（skip / no-start）"
@@ -669,7 +712,8 @@ start_clearance() {
   fi
   log "启动 clearance 清障栈..."
   if [ -f "$INSTALL_DIR/clearance/docker-compose.yml" ]; then
-    (cd "$INSTALL_DIR/clearance" && docker compose up -d) || \
+    write_clearance_env "$INSTALL_DIR/clearance"
+    (cd "$INSTALL_DIR/clearance" && PRIVOXY_IMAGE="$(resolve_privoxy_image)" docker compose up -d) || \
       warn "clearance 启动失败，可稍后: cd $INSTALL_DIR/clearance && docker compose up -d"
     (cd "$INSTALL_DIR/clearance" && docker compose ps) || true
   fi
@@ -875,10 +919,12 @@ install_linux() {
   if ! apt-cache show libasound2t64 >/dev/null 2>&1; then
     ALSA_PKG=libasound2
   fi
+  # xvfb: 无图形桌面时 offscreen 有头 Chromium 必需（Missing X server / $DISPLAY）
   apt-get install -y --no-install-recommends \
     git curl ca-certificates gnupg lsb-release \
     build-essential make \
     python3 python3-pip python3-venv \
+    xvfb \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
     libxrandr2 libgbm1 "$ALSA_PKG" libpango-1.0-0 libcairo2 \

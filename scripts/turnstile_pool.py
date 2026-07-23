@@ -73,6 +73,23 @@ def launch_args(mode: str) -> list[str]:
     return args
 
 
+def require_display(mode: str) -> None:
+    """Headed offscreen needs X11; Go normally wraps with xvfb-run when missing."""
+    m = (mode or "offscreen").strip().lower()
+    if m in ("", "auto"):
+        m = "offscreen"
+    if m == "headless":
+        return
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return
+    raise RuntimeError(
+        "Missing X server / $DISPLAY for TURNSTILE_MODE=offscreen. "
+        "Install xvfb and re-run via grok (auto xvfb-run), or: "
+        "apt-get install -y xvfb && xvfb-run -a <this script ...>; "
+        "or set TURNSTILE_MODE=headless (often CF 600010)."
+    )
+
+
 class Slot:
     def __init__(self, chrome: str, proxy: str, mode: str = "offscreen") -> None:
         self.chrome = chrome
@@ -90,6 +107,7 @@ class Slot:
             return
         from playwright.async_api import async_playwright
 
+        require_display(self.mode)
         use_headless = self.mode == "headless"
         launch: dict = {
             "executable_path": self.chrome,

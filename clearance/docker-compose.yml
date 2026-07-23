@@ -42,8 +42,12 @@ services:
       retries: 5
       start_period: 30s
 
+  # Privoxy image by host arch (set PRIVOXY_IMAGE to override):
+  #   amd64/x86_64 → vimagick/privoxy:latest
+  #   arm64/aarch64 → lusky3/privoxy:latest  (vimagick 无 arm 镜像)
+  # install.sh / grok EnsureStack 会按架构写入本目录 .env 并 export。
   privoxy:
-    image: vimagick/privoxy:latest
+    image: ${PRIVOXY_IMAGE:-vimagick/privoxy:latest}
     container_name: grok-clearance-privoxy
     restart: unless-stopped
     depends_on:
@@ -54,7 +58,12 @@ services:
     ports:
       - "127.0.0.1:${PRIVOXY_PORT:-40080}:8118"
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 8118 || exit 1"]
+      # 兼容 nc / bash /dev/tcp（不同 privoxy 基础镜像工具集不一）
+      test:
+        [
+          "CMD-SHELL",
+          "nc -z 127.0.0.1 8118 2>/dev/null || (command -v bash >/dev/null && bash -c 'echo > /dev/tcp/127.0.0.1/8118') || exit 1",
+        ]
       interval: 30s
       timeout: 5s
       retries: 5
