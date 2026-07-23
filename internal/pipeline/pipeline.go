@@ -269,10 +269,22 @@ func (e *Engine) run(ctx context.Context) error {
 		TestmailAPIKey:    cfg.TestmailAPIKey,
 		TestmailNamespace: cfg.TestmailNamespace,
 		TestmailDomain:    cfg.TestmailDomain,
+		CFTempAPI:         cfg.CFTempEmailAPI,
+		CFTempAdmin:       cfg.CFTempEmailAdmin,
+		CFTempDomain:      cfg.CFTempEmailDomain,
+		CFTempAuth:        cfg.CFTempEmailAuth,
+		CFTempPrefix:      cfg.CFTempEmailPrefix,
 	})
-	if cfg.EmailMode == config.EmailTestmail {
+	switch cfg.EmailMode {
+	case config.EmailTestmail:
 		log.Infof("Email mode=testmail namespace=%s domain=%s", cfg.TestmailNamespace, cfg.TestmailDomain)
-	} else {
+	case config.EmailCFTemp:
+		dom := cfg.CFTempEmailDomain
+		if dom == "" {
+			dom = "(Worker auto)"
+		}
+		log.Infof("Email mode=cf_temp_email api=%s domain=%s admin=%v", cfg.CFTempEmailAPI, dom, cfg.CFTempEmailAdmin != "")
+	default:
 		log.Infof("Email mode=%s", cfg.EmailMode)
 	}
 	tsMode := cfg.TurnstileMode
