@@ -610,7 +610,7 @@ CPA_MANAGEMENT_BASE=http://127.0.0.1:8317/v0/management
 ### 2026-07 · OAuth / 运维 / 导出
 
 - **OAuth**：全局启动间隔（默认 4s）、OIDC discovery 缓存、`rate_limited` 自动重试一次；高并发默认 1 个 OAuth worker
-- **探活**：`PROBE_WARMUP_SEC` 默认 1.5s；403 重试间隔缩短
+- **探活**：`PROBE_WARMUP_SEC` 默认 **5s**；403/5xx 多轮退避重试
 - **`grok stop`**：在 `CLEARANCE_AUTO_STOP=1` 时同步 `docker compose stop` 清障栈（以前只有达目标/正常结束才停）
 - **安装安全**：非默认 `INSTALL_DIR` 且无 `.git` 时不再 `rm -rf` 整目录；危险/非空非本仓目录直接拒绝
 - **grok2api**：`outputs/<run>/grok2api/tokens.txt` 仅 SSO token，一行一个
@@ -648,9 +648,9 @@ grep -q '^CLEARANCE_AUTO_STOP=' "$CFG" 2>/dev/null || echo 'CLEARANCE_AUTO_STOP=
 grep -q '^CF_IMPERSONATE=' "$CFG" 2>/dev/null || echo 'CF_IMPERSONATE=chrome_131' >>"$CFG"
 grep -q '^CF_IMPERSONATE_FALLBACK=' "$CFG" 2>/dev/null || echo 'CF_IMPERSONATE_FALLBACK=chrome_124,chrome_120' >>"$CFG"
 grep -q '^TURNSTILE_MODE=' "$CFG" 2>/dev/null || echo 'TURNSTILE_MODE=offscreen' >>"$CFG"
-grep -q '^OAUTH_MIN_INTERVAL_SEC=' "$CFG" 2>/dev/null || echo 'OAUTH_MIN_INTERVAL_SEC=4' >>"$CFG"
-grep -q '^OAUTH_RETRY_SEC=' "$CFG" 2>/dev/null || echo 'OAUTH_RETRY_SEC=45' >>"$CFG"
-grep -q '^PROBE_WARMUP_SEC=' "$CFG" 2>/dev/null || echo 'PROBE_WARMUP_SEC=1.5' >>"$CFG"
+grep -q '^OAUTH_MIN_INTERVAL_SEC=' "$CFG" 2>/dev/null || echo 'OAUTH_MIN_INTERVAL_SEC=6' >>"$CFG"
+grep -q '^OAUTH_RETRY_SEC=' "$CFG" 2>/dev/null || echo 'OAUTH_RETRY_SEC=60' >>"$CFG"
+grep -q '^PROBE_WARMUP_SEC=' "$CFG" 2>/dev/null || echo 'PROBE_WARMUP_SEC=5' >>"$CFG"
 
 # 4) 验证
 which grok; grok help
@@ -669,14 +669,14 @@ curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scr
 
 # 3) 补 config（同 Linux，CFG=~/.grok/config.env）
 CFG="${GROK_HOME:-$HOME/.grok}/config.env"
-grep -q '^OAUTH_MIN_INTERVAL_SEC=' "$CFG" 2>/dev/null || echo 'OAUTH_MIN_INTERVAL_SEC=4' >>"$CFG"
-grep -q '^OAUTH_RETRY_SEC=' "$CFG" 2>/dev/null || echo 'OAUTH_RETRY_SEC=45' >>"$CFG"
-grep -q '^PROBE_WARMUP_SEC=' "$CFG" 2>/dev/null || echo 'PROBE_WARMUP_SEC=1.5' >>"$CFG"
+grep -q '^OAUTH_MIN_INTERVAL_SEC=' "$CFG" 2>/dev/null || echo 'OAUTH_MIN_INTERVAL_SEC=6' >>"$CFG"
+grep -q '^OAUTH_RETRY_SEC=' "$CFG" 2>/dev/null || echo 'OAUTH_RETRY_SEC=60' >>"$CFG"
+grep -q '^PROBE_WARMUP_SEC=' "$CFG" 2>/dev/null || echo 'PROBE_WARMUP_SEC=5' >>"$CFG"
 grep -q '^TURNSTILE_MODE=' "$CFG" 2>/dev/null || echo 'TURNSTILE_MODE=offscreen' >>"$CFG"
 grep -q '^CLEARANCE_AUTO_STOP=' "$CFG" 2>/dev/null || echo 'CLEARANCE_AUTO_STOP=1' >>"$CFG"
 ```
 
-可选调参：OAuth 仍限流可把 `OAUTH_MIN_INTERVAL_SEC` 调到 `6`–`8`，或 `OAUTH_WORKERS=1`。
+默认节奏（新装/代码 Defaults）：`OAUTH_MIN_INTERVAL_SEC=6`、`PROBE_WARMUP_SEC=5`、`OAUTH_RETRY_SEC=60`；交互线程回车=**2**。仍 429 可再把间隔调到 8。
 
 ---
 

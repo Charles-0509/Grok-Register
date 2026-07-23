@@ -109,7 +109,7 @@ func WriteAtomic(dir string, doc Document, secret []byte) (string, error) {
 // warmupSec: sleep before first attempt (0 uses 1.5s default; negative = no sleep).
 func Probe(doc Document, proxy string, warmupSec ...float64) error {
 	_ = proxy
-	warm := 1.5
+	warm := 5.0
 	if len(warmupSec) > 0 {
 		warm = warmupSec[0]
 	}

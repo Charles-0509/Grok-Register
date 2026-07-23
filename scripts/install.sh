@@ -538,9 +538,9 @@ apply_network_to_config() {
   env_set_key "$dest" "CF_IMPERSONATE_FALLBACK" "chrome_124,chrome_120"
   env_set_key "$dest" "TURNSTILE_MODE" "offscreen"
   # OAuth 限速 + 探活（大更新默认）
-  env_set_key "$dest" "OAUTH_MIN_INTERVAL_SEC" "4"
-  env_set_key "$dest" "OAUTH_RETRY_SEC" "45"
-  env_set_key "$dest" "PROBE_WARMUP_SEC" "1.5"
+  env_set_key "$dest" "OAUTH_MIN_INTERVAL_SEC" "6"
+  env_set_key "$dest" "OAUTH_RETRY_SEC" "60"
+  env_set_key "$dest" "PROBE_WARMUP_SEC" "5"
   if [ -n "${INSTALL_DIR:-}" ] && [ -d "$INSTALL_DIR/clearance" ]; then
     env_set_key "$dest" "CLEARANCE_COMPOSE_DIR" "$INSTALL_DIR/clearance"
   fi
@@ -577,10 +577,10 @@ TEMPMAIL_LOL_MIN_INTERVAL_MS=1500
 HTTPS_PROXY=http://127.0.0.1:40080
 HTTP_PROXY=http://127.0.0.1:40080
 NO_PROXY=127.0.0.1,localhost
-OAUTH_MIN_INTERVAL_SEC=4
-OAUTH_RETRY_SEC=45
+OAUTH_MIN_INTERVAL_SEC=6
+OAUTH_RETRY_SEC=60
 PROBE_ENABLED=1
-PROBE_WARMUP_SEC=1.5
+PROBE_WARMUP_SEC=5
 CPA_UPLOAD_ENABLED=0
 CPA_MANAGEMENT_BASE=http://127.0.0.1:8317/v0/management
 CPA_MANAGEMENT_KEY=
@@ -769,9 +769,9 @@ merge_upgrade_keys() {
   env_set_key_if_missing "$dest" "CF_IMPERSONATE" "chrome_131"
   env_set_key_if_missing "$dest" "CF_IMPERSONATE_FALLBACK" "chrome_124,chrome_120"
   env_set_key_if_missing "$dest" "TURNSTILE_MODE" "offscreen"
-  env_set_key_if_missing "$dest" "OAUTH_MIN_INTERVAL_SEC" "4"
-  env_set_key_if_missing "$dest" "OAUTH_RETRY_SEC" "45"
-  env_set_key_if_missing "$dest" "PROBE_WARMUP_SEC" "1.5"
+  env_set_key_if_missing "$dest" "OAUTH_MIN_INTERVAL_SEC" "6"
+  env_set_key_if_missing "$dest" "OAUTH_RETRY_SEC" "60"
+  env_set_key_if_missing "$dest" "PROBE_WARMUP_SEC" "5"
   if [ -n "${INSTALL_DIR:-}" ] && [ -d "$INSTALL_DIR/clearance" ]; then
     env_set_key_if_missing "$dest" "CLEARANCE_COMPOSE_DIR" "$INSTALL_DIR/clearance"
   fi

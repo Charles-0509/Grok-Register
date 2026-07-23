@@ -102,9 +102,10 @@ func printHelp() {
 
 说明:
   -t / --target   目标账号数 = 探活成功写入 CPA/ 的数量 (1-10000)
-  --thread / -j   并发注册/Turnstile 线程数 (1-8)，不再写入 config.env
+  --thread / -j   并发注册/Turnstile 线程数 (1-8)，默认交互回车=2（较稳）
   logs 等级:      默认 --info（隐藏 DBG）；--debug 显示全部；--warn / --error 更严
                   例: grok logs -f --debug
+  默认节奏:       OAUTH_MIN_INTERVAL_SEC=6  PROBE_WARMUP_SEC=5  OAUTH_RETRY_SEC=60
   升级后请查看 ~/.grok/config.env.example 了解新增配置项
 
 数据目录: ~/.grok/ (可用 GROK_HOME 覆盖)
