@@ -76,6 +76,57 @@ def parse_cookie_header(raw: str) -> list[dict]:
     return out
 
 
+def has_display() -> bool:
+    return bool(
+        (os.environ.get("DISPLAY") or "").strip()
+        or (os.environ.get("WAYLAND_DISPLAY") or "").strip()
+    )
+
+
+def resolve_launch_mode(mode: str) -> tuple[str, bool]:
+    """Return (label, headless).
+
+    offscreen prefers headed+window off-screen when a display exists (incl. Xvfb).
+    On bare Linux servers without DISPLAY, fall back to headless so launch works
+    (may be weaker vs Turnstile; install xvfb and re-run with DISPLAY for offscreen).
+    """
+    mode = (mode or "offscreen").strip().lower()
+    if mode in ("", "auto"):
+        mode = "offscreen"
+    if mode == "headless":
+        return "headless", True
+    if has_display():
+        return "offscreen", False
+    print(
+        "warn: TURNSTILE_MODE=offscreen but no $DISPLAY; "
+        "using headless fallback. For true offscreen on servers: "
+        "apt install xvfb && (export DISPLAY=:99; Xvfb :99 -screen 0 1280x720x24 &) "
+        "or: xvfb-run -a grok start ...",
+        file=sys.stderr,
+    )
+    return "headless-no-display", True
+
+
+def launch_args(label: str) -> list[str]:
+    args = [
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-infobars",
+        "--disable-dev-shm-usage",
+    ]
+    # offscreen: headed browser moved off-screen (true headless often gets Turnstile 600010)
+    if label == "offscreen":
+        args.extend(
+            [
+                "--window-position=-32000,-32000",
+                "--window-size=800,600",
+            ]
+        )
+    return args
+
+
 async def mint(
     site_key: str,
     page_url: str,
@@ -84,21 +135,16 @@ async def mint(
     cookies: list[dict],
     timeout: float,
     ua: str,
+    mode: str = "offscreen",
 ) -> str:
     from playwright.async_api import async_playwright
 
-    # Match grok_register/register.py _launch_options()
+    label, use_headless = resolve_launch_mode(mode)
+
     launch: dict = {
         "executable_path": chrome,
-        "headless": True,
-        "args": [
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-infobars",
-            "--disable-dev-shm-usage",
-        ],
+        "headless": use_headless,
+        "args": launch_args(label),
     }
     if proxy:
         # Playwright accepts {"server": "http://..."}
@@ -269,6 +315,12 @@ def main() -> int:
     ap.add_argument("--cookie", default="")
     ap.add_argument("--ua", default="")
     ap.add_argument("--timeout", type=float, default=90)
+    ap.add_argument(
+        "--mode",
+        default="offscreen",
+        choices=("offscreen", "headless", "auto"),
+        help="offscreen=headed off-display (default); headless=true headless (often blocked)",
+    )
     args = ap.parse_args()
 
     chrome = args.chrome.strip() or find_chrome()
@@ -286,6 +338,7 @@ def main() -> int:
                 cookies=cookies,
                 timeout=args.timeout,
                 ua=args.ua.strip(),
+                mode=args.mode,
             )
         )
     except Exception as exc:

@@ -30,11 +30,14 @@ var codeRe = []*regexp.Regexp{
 }
 
 type Handle struct {
-	Kind     string // lol | mt | custom
+	Kind     string // lol | mt | custom | testmail
 	Email    string
 	Password string
 	Token    string
 	Base     string // mail.tm base
+	// testmail.app
+	Tag       string
+	Timestamp int64 // ms — only accept mails after Create()
 }
 
 type Provider struct {
@@ -50,7 +53,11 @@ type Config struct {
 	API           string
 	LOLRetries    int
 	LOLIntervalMS int
-	HTTPClient    *http.Client
+	// testmail.app
+	TestmailAPIKey    string
+	TestmailNamespace string
+	TestmailDomain    string
+	HTTPClient        *http.Client
 }
 
 func New(cfg Config) *Provider {
@@ -77,32 +84,63 @@ func randStr(n int) string {
 
 func (p *Provider) Create() (Handle, error) {
 	password := randStr(15)
-	if p.cfg.Mode == config.EmailCustom {
+	switch p.cfg.Mode {
+	case config.EmailCustom:
 		email := fmt.Sprintf("oc%s@%s", randStr(10), p.cfg.Domain)
 		return Handle{Kind: "custom", Email: email, Password: password}, nil
-	}
-	var last error
-	for i := 0; i < p.cfg.LOLRetries; i++ {
-		h, err := p.lolCreate()
-		if err == nil {
-			h.Password = password
-			return h, nil
+	case config.EmailTestmail:
+		h, err := p.testmailCreate()
+		if err != nil {
+			return Handle{}, err
 		}
-		last = err
-		time.Sleep(time.Duration(50*(i+1)) * time.Millisecond)
-	}
-	// mail.tm family fallback
-	for _, base := range []string{"https://api.mail.tm", "https://api.mail.gw", "https://api.duckmail.sbs"} {
-		h, err := p.mailtmCreate(base, password)
-		if err == nil {
-			return h, nil
+		h.Password = password
+		return h, nil
+	default:
+		// tempmail.lol then mail.tm family
+		var last error
+		for i := 0; i < p.cfg.LOLRetries; i++ {
+			h, err := p.lolCreate()
+			if err == nil {
+				h.Password = password
+				return h, nil
+			}
+			last = err
+			time.Sleep(time.Duration(50*(i+1)) * time.Millisecond)
 		}
-		last = err
+		for _, base := range []string{"https://api.mail.tm", "https://api.mail.gw", "https://api.duckmail.sbs"} {
+			h, err := p.mailtmCreate(base, password)
+			if err == nil {
+				return h, nil
+			}
+			last = err
+		}
+		if last == nil {
+			last = fmt.Errorf("所有临时邮箱 provider 均不可用")
+		}
+		return Handle{}, last
 	}
-	if last == nil {
-		last = fmt.Errorf("所有临时邮箱 provider 均不可用")
+}
+
+// testmailCreate builds {namespace}.{tag}@{domain} — tags need no pre-registration.
+// Docs: https://testmail.app/docs  JSON API livequery + tag filter.
+func (p *Provider) testmailCreate() (Handle, error) {
+	key := strings.TrimSpace(p.cfg.TestmailAPIKey)
+	ns := strings.TrimSpace(p.cfg.TestmailNamespace)
+	if key == "" || ns == "" {
+		return Handle{}, fmt.Errorf("testmail: set TESTMAIL_API_KEY and TESTMAIL_NAMESPACE")
 	}
-	return Handle{}, last
+	dom := strings.TrimSpace(p.cfg.TestmailDomain)
+	if dom == "" {
+		dom = "inbox.testmail.app"
+	}
+	tag := "g" + randStr(12)
+	email := fmt.Sprintf("%s.%s@%s", ns, tag, dom)
+	return Handle{
+		Kind:      "testmail",
+		Email:     email,
+		Tag:       tag,
+		Timestamp: time.Now().UnixMilli(),
+	}, nil
 }
 
 func (p *Provider) lolCreate() (Handle, error) {
@@ -296,9 +334,68 @@ func (p *Provider) fetch(h Handle) (string, error) {
 		defer resp2.Body.Close()
 		b2, _ := io.ReadAll(io.LimitReader(resp2.Body, 2<<20))
 		return string(b2), nil
+	case "testmail":
+		return p.testmailFetch(h)
 	default:
 		return "", fmt.Errorf("unknown handle kind")
 	}
+}
+
+func (p *Provider) testmailFetch(h Handle) (string, error) {
+	key := strings.TrimSpace(p.cfg.TestmailAPIKey)
+	ns := strings.TrimSpace(p.cfg.TestmailNamespace)
+	if key == "" || ns == "" {
+		return "", fmt.Errorf("testmail not configured")
+	}
+	// Prefer short poll without livequery (avoids 307 long hangs under proxy).
+	q := url.Values{}
+	q.Set("apikey", key)
+	q.Set("namespace", ns)
+	q.Set("tag", h.Tag)
+	q.Set("limit", "5")
+	if h.Timestamp > 0 {
+		q.Set("timestamp_from", fmt.Sprintf("%d", h.Timestamp-2000))
+	}
+	// Direct to api.testmail.app — do not force register proxy if NO_PROXY includes it;
+	// still use HTTPClient which may have proxy from env.
+	u := "https://api.testmail.app/api/json?" + q.Encode()
+	// Longer timeout client for occasional slow inbox
+	client := p.cfg.HTTPClient
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode == 429 {
+		return "", fmt.Errorf("testmail rate limited")
+	}
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("testmail http=%d body=%s", resp.StatusCode, truncate(string(body), 80))
+	}
+	var data map[string]any
+	if err := json.Unmarshal(body, &data); err != nil {
+		return "", err
+	}
+	if r, _ := data["result"].(string); r == "fail" {
+		msg, _ := data["message"].(string)
+		return "", fmt.Errorf("testmail fail: %s", msg)
+	}
+	emails, _ := data["emails"].([]any)
+	var b strings.Builder
+	for _, it := range emails {
+		m, _ := it.(map[string]any)
+		if m == nil {
+			continue
+		}
+		fmt.Fprintf(&b, "%v\n%v\n%v\n%v\n", m["subject"], m["text"], m["html"], m["body"])
+	}
+	return b.String(), nil
 }
 
 func extractCode(text string) string {

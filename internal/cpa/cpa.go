@@ -105,33 +105,57 @@ func WriteAtomic(dir string, doc Document, secret []byte) (string, error) {
 }
 
 // Probe hits cli-chat-proxy with minimal responses call (acpa_watchdog shape).
-// New tokens often get transient 403 permission-denied; warmup + short retries.
-// Returns nil if alive.
-func Probe(doc Document, proxy string) error {
+// New tokens often get transient 403 permission-denied; 5xx/timeout also retry.
+// warmupSec: sleep before first attempt (0 uses 1.5s default; negative = no sleep).
+func Probe(doc Document, proxy string, warmupSec ...float64) error {
 	_ = proxy
-	// Warmup: mint-then-immediate chat often 403s.
-	time.Sleep(3 * time.Second)
+	warm := 5.0
+	if len(warmupSec) > 0 {
+		warm = warmupSec[0]
+	}
+	if warm > 0 {
+		time.Sleep(time.Duration(warm * float64(time.Second)))
+	}
 
+	// attempt 0 immediate after warmup; then 3s, 6s, 12s, 20s (covers slow account provision)
+	backs := []time.Duration{0, 3 * time.Second, 6 * time.Second, 12 * time.Second, 20 * time.Second}
 	var last error
-	// Immediate 403 retries (default 2 sleeps of 4s like ACPA_403_IMMEDIATE_*)
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			time.Sleep(4 * time.Second)
+	for attempt := 0; attempt < len(backs); attempt++ {
+		if backs[attempt] > 0 {
+			time.Sleep(backs[attempt])
 		}
 		err := probeOnce(doc)
 		if err == nil {
 			return nil
 		}
 		last = err
-		msg := err.Error()
-		// transient permission-denied — retry
-		if strings.Contains(msg, "permission-denied") || strings.Contains(msg, "chat endpoint is denied") || strings.Contains(msg, "http=403") {
+		if probeRetryable(err) {
 			continue
 		}
-		// non-retryable
 		return err
 	}
 	return last
+}
+
+func probeRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "permission-denied") ||
+		strings.Contains(msg, "chat endpoint is denied") ||
+		strings.Contains(msg, "http=403") ||
+		strings.Contains(msg, "http=429") ||
+		strings.Contains(msg, "http=500") ||
+		strings.Contains(msg, "http=502") ||
+		strings.Contains(msg, "http=503") ||
+		strings.Contains(msg, "http=504") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "EOF") {
+		return true
+	}
+	return false
 }
 
 func probeOnce(doc Document) error {
@@ -220,6 +244,26 @@ func AppendSSO(accountsPath, email, password, sso string) error {
 	}
 	defer f.Close()
 	_, err = fmt.Fprintf(f, "%s:%s:%s\n", email, password, sso)
+	return err
+}
+
+// AppendGrok2APIToken writes one SSO/session token per line (no email/password).
+// For importers that only accept a bare token (e.g. grok2api).
+func AppendGrok2APIToken(dir, token string) error {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "tokens.txt")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintf(f, "%s\n", token)
 	return err
 }
 

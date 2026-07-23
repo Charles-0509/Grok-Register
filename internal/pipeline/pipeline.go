@@ -63,15 +63,72 @@ type Engine struct {
 	oauthCh  chan SSOJob
 	uploader *cpa.Uploader
 
-	done atomic.Int64
-	ssoN atomic.Int64
-	oaN  atomic.Int64
-	fail atomic.Int64
+	done     atomic.Int64 // CPA successes (counts toward -t)
+	reserved atomic.Int64 // in-flight accounts (email→register→oauth→probe)
+	ssoN     atomic.Int64
+	oaN      atomic.Int64
+	fail     atomic.Int64
 
-	start   time.Time
-	wgReg   sync.WaitGroup // S/P/C
-	wgOAuth sync.WaitGroup
-	wgAux   sync.WaitGroup // status ticker etc
+	// Global OAuth pacing (shared by all oauth workers) — avoids dual-worker rate_limited.
+	oauthGateMu    sync.Mutex
+	oauthLastStart time.Time
+
+	start    time.Time
+	wgReg    sync.WaitGroup // S/P/C
+	wgOAuth  sync.WaitGroup
+	wgAux    sync.WaitGroup // status ticker etc
+	wgUpload sync.WaitGroup // async CPA management uploads
+}
+
+// remainingCapacity = target - done - reserved (how many new accounts may start).
+func (e *Engine) remainingCapacity() int {
+	n := e.opt.Target - int(e.done.Load()) - int(e.reserved.Load())
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// tryReserve claims one pipeline seat for a new account attempt.
+func (e *Engine) tryReserve() bool {
+	for {
+		d := e.done.Load()
+		r := e.reserved.Load()
+		if d+r >= int64(e.opt.Target) {
+			return false
+		}
+		if e.reserved.CompareAndSwap(r, r+1) {
+			return true
+		}
+	}
+}
+
+func (e *Engine) releaseReserve() {
+	for {
+		r := e.reserved.Load()
+		if r <= 0 {
+			return
+		}
+		if e.reserved.CompareAndSwap(r, r-1) {
+			return
+		}
+	}
+}
+
+// tryComplete moves a reserved seat into done. Returns (newDone, ok).
+// ok=false means target already met (caller should discard extra success).
+func (e *Engine) tryComplete() (int64, bool) {
+	for {
+		d := e.done.Load()
+		if d >= int64(e.opt.Target) {
+			e.releaseReserve()
+			return d, false
+		}
+		if e.done.CompareAndSwap(d, d+1) {
+			e.releaseReserve()
+			return d + 1, true
+		}
+	}
 }
 
 func Run(ctx context.Context, opt Options) error {
@@ -92,24 +149,30 @@ func (e *Engine) run(ctx context.Context) error {
 
 	sWorkers, pWorkers, cWorkers, oauthWorkers, physCap := deriveWorkers(cfg)
 	e.phys = inventory.NewSemaphore(physCap)
-	// Pending email codes in flight: cap by target so target=5 doesn't open 12 boxes.
-	qPend := cfg.Target
-	if qPend <= 0 {
-		qPend = 4
-	}
-	if qPend > 6 {
-		qPend = 6
-	}
+	// Pending email codes in flight: follow --thread (was hard cap 6 → reserved flood).
+	qPend := sWorkers + 1
 	if qPend < 2 {
 		qPend = 2
 	}
+	if qPend > 4 {
+		qPend = 4
+	}
+	if cfg.Target > 0 && cfg.Target < qPend {
+		qPend = cfg.Target
+	}
 	e.qPending = inventory.NewSemaphore(qPend)
-	tSlots, qSlots := 4, 4
-	if cfg.Target > 0 && cfg.Target < 4 {
+	tSlots, qSlots := sWorkers+1, sWorkers+1
+	if tSlots < 2 {
+		tSlots, qSlots = 2, 2
+	}
+	if tSlots > 5 {
+		tSlots, qSlots = 5, 5
+	}
+	if cfg.Target > 0 && cfg.Target < tSlots {
 		tSlots, qSlots = cfg.Target, cfg.Target
 	}
 	e.inv = inventory.New[string, QItem](tSlots, qSlots)
-	log.Infof("workers S=%d P=%d C=%d OAuth=%d phys=%d q_pending=%d", sWorkers, pWorkers, cWorkers, oauthWorkers, physCap, qPend)
+	log.Infof("workers S=%d P=%d C=%d OAuth=%d phys=%d q_pending=%d t/q_slots=%d", sWorkers, pWorkers, cWorkers, oauthWorkers, physCap, qPend, tSlots)
 
 	_ = st.Set(func(s *state.Snapshot) {
 		s.Status = state.StatusRunning
@@ -126,42 +189,109 @@ func (e *Engine) run(ctx context.Context) error {
 		s.Error = ""
 	})
 
-	// Clearance
-	if cfg.ClearanceEnabled {
-		e.cm = clearance.NewManager(cfg.FlareSolverrURL, cfg.ClearanceProxy, cfg.ClearanceURLs)
-		msg, err := e.cm.Prewarm()
-		if err != nil {
-			log.Warnf("clearance: %v (%s)", err, msg)
-		} else {
-			log.Infof("[clearance] %s", msg)
+	// Clearance mode: auto (protocol first) | always | never
+	clearMode := strings.ToLower(strings.TrimSpace(cfg.ClearanceMode))
+	if clearMode == "" {
+		clearMode = "auto"
+	}
+	if !cfg.ClearanceEnabled {
+		clearMode = "never"
+	}
+	stackStarted := false
+	stopStack := func() {
+		if !stackStarted || !cfg.ClearanceAutoStop {
+			return
 		}
-	} else {
-		log.Info("[clearance] 未启用")
+		sm, serr := clearance.StopStack(cfg.ClearanceComposeDir)
+		if serr != nil {
+			log.Warnf("[clearance] 自动停止失败: %v", serr)
+		} else {
+			log.Infof("[clearance] %s", sm)
+		}
+	}
+	defer stopStack()
+
+	ensureClearance := func(reason string) {
+		if clearMode == "never" {
+			return
+		}
+		log.Infof("[clearance] 拉起清障栈 (%s)…", reason)
+		msg, err := clearance.EnsureStack(cfg.ClearanceComposeDir, 40080, 8191)
+		if err != nil {
+			log.Warnf("[clearance] 自动拉起失败: %v", err)
+			return
+		}
+		stackStarted = true
+		log.Infof("[clearance] %s", msg)
+		e.cm = clearance.NewManager(cfg.FlareSolverrURL, cfg.ClearanceProxy, cfg.ClearanceURLs)
+		if msg2, err2 := e.cm.Prewarm(); err2 != nil {
+			log.Warnf("[clearance] 预热: %v (%s)", err2, msg2)
+		} else {
+			log.Infof("[clearance] %s", msg2)
+		}
+	}
+
+	switch clearMode {
+	case "always":
+		log.Info("[clearance] CLEARANCE_MODE=always")
+		ensureClearance("always")
+	case "never":
+		log.Info("[clearance] CLEARANCE_MODE=never（协议 TLS 直连/代理，无 Docker 清障）")
+	default:
+		log.Info("[clearance] CLEARANCE_MODE=auto（协议优先，CF 拦截时再拉清障）")
+	}
+	if cfg.ClearanceAutoStop && clearMode != "never" {
+		log.Info("[clearance] CLEARANCE_AUTO_STOP=1：本 run 若拉起栈，结束时将 stop")
 	}
 
 	var err error
-	e.xai, err = protocol.NewClient(cfg.RegisterProxy, e.cm)
+	imp := cfg.CFImpersonate
+	if imp == "" {
+		imp = "chrome_131"
+	}
+	e.xai, err = protocol.NewClientOpts(protocol.ClientOptions{
+		Proxy:               cfg.RegisterProxy,
+		Clearance:           e.cm,
+		Impersonate:         imp,
+		ImpersonateFallback: protocol.FallbackProfiles(cfg.CFImpersonateFallback),
+	})
 	if err != nil {
 		return err
 	}
+	log.Infof("[cf] TLS impersonate=%s fallback=%s proxy=%v", e.xai.Profile(), cfg.CFImpersonateFallback, cfg.RegisterProxy != "")
+
 	e.mail = email.New(email.Config{
-		Mode:          cfg.EmailMode,
-		Domain:        cfg.EmailDomain,
-		API:           cfg.EmailAPI,
-		LOLRetries:    cfg.TempmailLOLRetries,
-		LOLIntervalMS: cfg.TempmailLOLIntervalMS,
+		Mode:              cfg.EmailMode,
+		Domain:            cfg.EmailDomain,
+		API:               cfg.EmailAPI,
+		LOLRetries:        cfg.TempmailLOLRetries,
+		LOLIntervalMS:     cfg.TempmailLOLIntervalMS,
+		TestmailAPIKey:    cfg.TestmailAPIKey,
+		TestmailNamespace: cfg.TestmailNamespace,
+		TestmailDomain:    cfg.TestmailDomain,
 	})
+	if cfg.EmailMode == config.EmailTestmail {
+		log.Infof("Email mode=testmail namespace=%s domain=%s", cfg.TestmailNamespace, cfg.TestmailDomain)
+	} else {
+		log.Infof("Email mode=%s", cfg.EmailMode)
+	}
+	tsMode := cfg.TurnstileMode
+	if tsMode == "" {
+		tsMode = "offscreen"
+	}
 	e.turn = turnstile.New(turnstile.Options{
 		Provider: cfg.TurnstileProvider,
 		LiteURL:  cfg.LiteSolverURL,
 		Proxy:    cfg.RegisterProxy,
 		Clear:    e.cm,
+		Workers:  sWorkers, // parallel S = pool slots
+		Mode:     tsMode,
 	})
 	if c, ok := e.turn.(turnstile.Closer); ok {
 		defer c.Close()
 	}
-	log.Infof("Turnstile provider=%s (Playwright mint preferred, chromedp fallback)", e.turn.Name())
-	log.Infof("Turnstile mint: python=%s script=%s", turnstile.DetectedPython(), turnstile.DetectedScript())
+	log.Infof("Turnstile provider=%s mode=%s workers=%d (pool → one-shot → chromedp)", e.turn.Name(), tsMode, sWorkers)
+	log.Infof("Turnstile mint: python=%s pool=%s script=%s", turnstile.DetectedPython(), turnstile.DetectedPoolScript(), turnstile.DetectedScript())
 	e.uploader = cpa.NewUploader(cpa.UploadConfig{
 		Enabled:      cfg.CPAUploadEnabled,
 		BaseURL:      cfg.CPAManagementBase,
@@ -186,8 +316,44 @@ func (e *Engine) run(ctx context.Context) error {
 		s.Phase = state.PhaseRegister
 		s.PhaseDetail = "获取注册配置"
 	})
-	log.Info("Fetching signup config...")
+	log.Info("Fetching signup config (protocol warm)…")
 	scfg, err := e.xai.FetchConfig()
+	if err != nil {
+		// Protocol-first: CF block → try profile fallbacks, then clearance auto
+		code := protocol.CodeOf(err)
+		log.Warnf("[cf] warm failed code=%s err=%v", code, err)
+		tried := map[string]struct{}{e.xai.Profile(): {}}
+		for _, fb := range protocol.FallbackProfiles(cfg.CFImpersonateFallback) {
+			if _, ok := tried[fb]; ok {
+				continue
+			}
+			tried[fb] = struct{}{}
+			log.Infof("[cf] try impersonate fallback=%s", fb)
+			if rerr := e.xai.RecreateWithProfile(fb); rerr != nil {
+				log.Warnf("[cf] recreate %s: %v", fb, rerr)
+				continue
+			}
+			scfg, err = e.xai.FetchConfig()
+			if err == nil {
+				log.Infof("[cf] warm ok profile=%s", e.xai.Profile())
+				break
+			}
+			log.Warnf("[cf] fallback %s failed: %v", fb, err)
+		}
+		if err != nil && clearMode == "auto" {
+			ensureClearance("cf_blocked")
+			// rebuild client with clearance cookies
+			e.xai, err = protocol.NewClientOpts(protocol.ClientOptions{
+				Proxy:       cfg.RegisterProxy,
+				Clearance:   e.cm,
+				Impersonate: e.xai.Profile(),
+			})
+			if err != nil {
+				return err
+			}
+			scfg, err = e.xai.FetchConfig()
+		}
+	}
 	if err != nil {
 		_ = st.Set(func(s *state.Snapshot) {
 			s.Status = state.StatusError
@@ -196,8 +362,8 @@ func (e *Engine) run(ctx context.Context) error {
 		})
 		return fmt.Errorf("config fetch: %w", err)
 	}
-	log.Infof("SITE_KEY=%s ACTION_ID=%s...", scfg.SiteKey, trim(scfg.ActionID, 12))
-	log.OKf("注册服务已启动 | 目标 %d | run=%s", e.opt.Target, e.opt.Run.RunID)
+	log.Infof("SITE_KEY=%s ACTION_ID=%s… source=%s profile=%s", scfg.SiteKey, trim(scfg.ActionID, 12), scfg.Source, e.xai.Profile())
+	log.OKf("注册服务已启动 | 目标 %d | run=%s | impersonate=%s", e.opt.Target, e.opt.Run.RunID, e.xai.Profile())
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -264,9 +430,31 @@ shutdown:
 	// 1) stop S/P/C producers (ctx canceled)
 	// 2) wait register workers so no more sends to oauthCh
 	// 3) close oauthCh so OAuth workers exit range
+	// 4) wait CPA management uploads (async; used to be killed on exit)
 	waitGroupTimeout(&e.wgReg, 15*time.Second, log, "register workers")
 	close(e.oauthCh)
 	waitGroupTimeout(&e.wgOAuth, 30*time.Second, log, "oauth workers")
+	uploadWait := 90 * time.Second
+	if cfg.CPAUploadEnabled {
+		// timeout * (retries+1) + verify + margin
+		to := cfg.CPAUploadTimeoutSec
+		if to <= 0 {
+			to = 30
+		}
+		retries := cfg.CPAUploadRetries
+		if retries < 0 {
+			retries = 0
+		}
+		uploadWait = time.Duration(to*(retries+1)+30) * time.Second
+		if uploadWait < 60*time.Second {
+			uploadWait = 60 * time.Second
+		}
+		if uploadWait > 5*time.Minute {
+			uploadWait = 5 * time.Minute
+		}
+		log.Infof("[cpa] 等待 Management 上传完成（最多 %s）…", uploadWait)
+	}
+	waitGroupTimeout(&e.wgUpload, uploadWait, log, "cpa upload")
 	waitGroupTimeout(&e.wgAux, 3*time.Second, log, "aux")
 
 	_ = st.Set(func(s *state.Snapshot) {
@@ -299,7 +487,7 @@ func (e *Engine) refreshState() {
 		s.FailCount = int(e.fail.Load())
 		s.RatePerMin = rate
 		if s.Phase == state.PhaseRegister || s.Phase == "" {
-			s.PhaseDetail = fmt.Sprintf("注册中 T=%d Q=%d done=%d/%d", t, q, e.done.Load(), e.opt.Target)
+			s.PhaseDetail = fmt.Sprintf("注册中 T=%d Q=%d done=%d/%d inflight=%d", t, q, e.done.Load(), e.opt.Target, e.reserved.Load())
 		}
 	})
 }
@@ -322,8 +510,33 @@ func (e *Engine) sWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 	log := e.opt.Log
 	pageURL := protocol.SiteURL + "/sign-up"
 	for {
-		if int(e.done.Load()) >= e.opt.Target {
+		if e.remainingCapacity() <= 0 && int(e.done.Load()) >= e.opt.Target {
 			return
+		}
+		// Don't mint far ahead of what we still need.
+		if e.remainingCapacity() <= 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+			if int(e.done.Load()) >= e.opt.Target {
+				return
+			}
+			continue
+		}
+		tDepth, _ := e.inv.Depths()
+		need := e.remainingCapacity()
+		if need < 1 {
+			need = 1
+		}
+		if tDepth >= need {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(400 * time.Millisecond):
+			}
+			continue
 		}
 		select {
 		case <-ctx.Done():
@@ -363,16 +576,29 @@ func (e *Engine) pWorker(ctx context.Context, id int) {
 			return
 		default:
 		}
-		// Admission: don't flood tempmail when T is empty or we already have enough Q.
-		// remaining CPA slots ≈ target - done; keep at most min(4, remaining) Q ready.
-		remaining := e.opt.Target - int(e.done.Load())
-		if remaining <= 0 {
-			return
+		// Global seat: done + reserved <= target (not per-worker).
+		if e.remainingCapacity() <= 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+			if int(e.done.Load()) >= e.opt.Target {
+				return
+			}
+			continue
 		}
+		// Don't flood Q ahead of Turnstile: cap pending Q near S workers.
 		_, qDepth := e.inv.Depths()
-		qCap := remaining
-		if qCap > 4 {
-			qCap = 4
+		qCap := e.opt.Cfg.TurnstileWorkers
+		if qCap < 1 {
+			qCap = 2
+		}
+		if qCap > 3 {
+			qCap = 3
+		}
+		if rem := e.remainingCapacity(); rem < qCap {
+			qCap = rem
 		}
 		if qCap < 1 {
 			qCap = 1
@@ -386,12 +612,24 @@ func (e *Engine) pWorker(ctx context.Context, id int) {
 			continue
 		}
 
+		// Reserve seat BEFORE creating email so multi-P cannot overshoot -t.
+		if !e.tryReserve() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(300 * time.Millisecond):
+			}
+			continue
+		}
+
 		if err := e.qPending.Acquire(ctx); err != nil {
+			e.releaseReserve()
 			return
 		}
 		h, err := e.mail.Create()
 		if err != nil {
 			e.qPending.Release()
+			e.releaseReserve()
 			log.Debugf("[P%d] create email: %v", id, err)
 			select {
 			case <-ctx.Done():
@@ -402,6 +640,7 @@ func (e *Engine) pWorker(ctx context.Context, id int) {
 		}
 		if err := e.xai.CreateEmailCode(h.Email); err != nil {
 			e.qPending.Release()
+			e.releaseReserve()
 			log.Debugf("[P%d] create code %s: %v", id, h.Email, err)
 			select {
 			case <-ctx.Done():
@@ -413,16 +652,24 @@ func (e *Engine) pWorker(ctx context.Context, id int) {
 		code, err := e.mail.PollCode(h, 90*time.Second)
 		if err != nil {
 			e.qPending.Release()
+			e.releaseReserve()
 			log.Debugf("[P%d] poll code: %v", id, err)
 			continue
 		}
 		item := QItem{Email: h.Email, Password: h.Password, Code: code, Handle: h}
-		if err := e.inv.PutQ(ctx, item, 2*time.Minute); err != nil {
+		// Q TTL must outlive slow Turnstile; onExpire frees reserved seat (was leaking → stuck).
+		email := h.Email
+		if err := e.inv.PutQWithExpire(ctx, item, 8*time.Minute, func() {
+			e.releaseReserve()
+			log.Warnf("[P%d] Q 过期丢弃 %s（座位已释放 reserved=%d）", id, email, e.reserved.Load())
+		}); err != nil {
 			e.qPending.Release()
+			e.releaseReserve()
 			return
 		}
 		e.qPending.Release()
-		log.Debugf("[P%d] Q ready %s", id, h.Email)
+		// seat stays reserved until signup fail / oauth fail / CPA success / Q TTL expire
+		log.Debugf("[P%d] Q ready %s (reserved=%d done=%d/%d)", id, h.Email, e.reserved.Load(), e.done.Load(), e.opt.Target)
 	}
 }
 
@@ -447,10 +694,15 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 
 		e.xai.ClearAuthCookies()
 		if err := e.xai.VerifyEmailCode(q.Email, q.Code); err != nil {
-			log.Warnf("verify fail %s: %v", q.Email, err)
+			log.Warnf("verify fail %s code=%s: %v", q.Email, protocol.CodeOf(err), err)
 			pair.Release()
 			e.fail.Add(1)
+			e.releaseReserve()
 			continue
+		}
+		// Optional ValidatePassword (document field 4/5); non-fatal
+		if err := e.xai.ValidatePassword(q.Email, q.Password); err != nil {
+			log.Debugf("validate_password skip/fail %s: %v", q.Email, err)
 		}
 		body := protocol.BuildSignupBody(q.Email, q.Password, q.Code, token)
 		text, sso, err := e.xai.SignupServerAction(body, scfg.ActionID, scfg.StateTree)
@@ -463,8 +715,9 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 			if len(preview) > 180 {
 				preview = preview[:180]
 			}
-			log.Warnf("signup fail %s: err=%v sso=%v body=%q", q.Email, err, sso != "", preview)
+			log.Warnf("signup fail %s code=%s err=%v sso=%v body=%q", q.Email, protocol.CodeOf(err), err, sso != "", preview)
 			e.fail.Add(1)
+			e.releaseReserve() // free seat for another attempt
 			continue
 		}
 
@@ -474,18 +727,25 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 			log.Warnf("write sso: %v", err)
 		}
 		_ = cpa.AppendAuthSession(filepath.Join(e.opt.Run.SSO, "auth-sessions.jsonl"), q.Email, sso)
+		// grok2api: bare SSO token only (one per line)
+		if e.opt.Run.Grok2API != "" {
+			if err := cpa.AppendGrok2APIToken(e.opt.Run.Grok2API, sso); err != nil {
+				log.Warnf("write grok2api token: %v", err)
+			}
+		}
 		n := e.ssoN.Add(1)
 		log.OKf("注册成功 #%d %s", n, q.Email)
 
 		job := SSOJob{Email: q.Email, Password: q.Password, SSO: sso}
 		select {
 		case <-ctx.Done():
+			e.releaseReserve()
 			return
 		case e.oauthCh <- job:
 		default:
-			// queue full or closing — try once more with context
 			select {
 			case <-ctx.Done():
+				e.releaseReserve()
 				return
 			case e.oauthCh <- job:
 			}
@@ -493,40 +753,57 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 	}
 }
 
+func (e *Engine) waitOAuthSlot(ctx context.Context) error {
+	minInterval := time.Duration(e.opt.Cfg.OAuthMinIntervalSec * float64(time.Second))
+	if minInterval < 0 {
+		minInterval = 0
+	}
+	for {
+		e.oauthGateMu.Lock()
+		wait := time.Duration(0)
+		if !e.oauthLastStart.IsZero() && minInterval > 0 {
+			wait = time.Until(e.oauthLastStart.Add(minInterval))
+		}
+		if wait <= 0 {
+			e.oauthLastStart = time.Now()
+			e.oauthGateMu.Unlock()
+			return nil
+		}
+		e.oauthGateMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
 func (e *Engine) oauthWorker(ctx context.Context, id int) {
 	defer e.wgOAuth.Done()
 	log := e.opt.Log
-	minInterval := time.Duration(e.opt.Cfg.OAuthMinIntervalSec * float64(time.Second))
-	if minInterval <= 0 {
-		minInterval = 10 * time.Second
-	}
-	var last time.Time
 	for job := range e.oauthCh {
+		// Soft-stop: still drain with seat accounting, but skip work past target.
 		if int(e.done.Load()) >= e.opt.Target {
+			e.releaseReserve()
 			continue
 		}
-		if !last.IsZero() {
-			if d := time.Until(last.Add(minInterval)); d > 0 {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(d):
-				}
-			}
+		if err := e.waitOAuthSlot(ctx); err != nil {
+			return
 		}
-		last = time.Now()
 		_ = e.opt.Store.Set(func(s *state.Snapshot) {
 			s.Phase = state.PhaseOAuth
 			s.PhaseDetail = fmt.Sprintf("正在 OAuth (%s)", job.Email)
 		})
 		log.Startf("OAuth %s", job.Email)
+		t0 := time.Now()
 		cred, err := e.oauth.Exchange(ctx, job.SSO)
 		if err != nil {
-			// browser fallback not implemented in v1 HTTP path — log and count fail
-			log.Warnf("OAuth fail %s: %v", job.Email, err)
+			log.Warnf("OAuth fail %s: %v (%.1fs)", job.Email, err, time.Since(t0).Seconds())
 			e.fail.Add(1)
+			e.releaseReserve()
 			continue
 		}
+		log.Infof("OAuth ok %s (%.1fs)", job.Email, time.Since(t0).Seconds())
 		e.oaN.Add(1)
 		doc := cpa.FromCredential(cred, job.Email)
 		_ = e.opt.Store.Set(func(s *state.Snapshot) {
@@ -534,33 +811,65 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 			s.PhaseDetail = fmt.Sprintf("探活 %s", job.Email)
 		})
 		if e.opt.Cfg.ProbeEnabled {
-			if err := cpa.Probe(doc, e.opt.Cfg.RegisterProxy); err != nil {
+			warmup := e.opt.Cfg.ProbeWarmupSec
+			if err := cpa.Probe(doc, e.opt.Cfg.RegisterProxy, warmup); err != nil {
 				log.Warnf("探活失败 %s: %v", job.Email, err)
 				path, _ := cpa.WriteAtomic(e.opt.Run.Discarded, doc, cpa.DefaultSecret())
 				_ = path
 				e.fail.Add(1)
+				e.releaseReserve()
 				continue
 			}
+		}
+		// Atomic complete: prevents multi-OAuth overshoot of -t.
+		d, ok := e.tryComplete()
+		if !ok {
+			// Target already filled by another worker — keep file in discarded.
+			path, _ := cpa.WriteAtomic(e.opt.Run.Discarded, doc, cpa.DefaultSecret())
+			log.Warnf("已达目标，额外号移入 discarded: %s (%s)", job.Email, filepath.Base(path))
+			continue
 		}
 		path, err := cpa.WriteAtomic(e.opt.Run.CPA, doc, cpa.DefaultSecret())
 		if err != nil {
 			log.Warnf("写 CPA 失败: %v", err)
+			// seat already converted to done; count as fail but don't re-open flood
 			e.fail.Add(1)
 			continue
 		}
-		// Auto-upload to CPA management (non-fatal).
 		if e.uploader != nil && e.uploader.Enabled() {
 			up := e.uploader
 			docCopy := doc
+			e.wgUpload.Add(1)
 			go func() {
+				defer e.wgUpload.Done()
 				defer func() { _ = recover() }()
-				_ = up.UploadDocument(docCopy)
+				log.Infof("[cpa] 开始上传 %s …", docCopy.Email)
+				res := up.UploadDocument(docCopy)
+				if res.Err != nil {
+					log.Warnf("[cpa] 上传失败 %s: %v", docCopy.Email, res.Err)
+				} else if !res.OK {
+					log.Warnf("[cpa] 上传失败 %s status=%d body=%s", docCopy.Email, res.Status, truncateRunes(res.Body, 180))
+				} else if res.Verified {
+					log.OKf("[cpa] 已入库 %s → %s", docCopy.Email, res.Name)
+				} else {
+					log.OKf("[cpa] 已上传 %s → %s（列表校验未命中，可能仍成功）", docCopy.Email, res.Name)
+				}
 			}()
 		}
-		d := e.done.Add(1)
 		log.OKf("CPA 就绪 #%d/%d %s -> %s", d, e.opt.Target, job.Email, filepath.Base(path))
 		e.refreshState()
 	}
+}
+
+func truncateRunes(s string, n int) string {
+	if n <= 0 || s == "" {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 func deriveWorkers(cfg config.Config) (s, p, c, oa, phys int) {
@@ -575,32 +884,66 @@ func deriveWorkers(cfg config.Config) (s, p, c, oa, phys int) {
 			phys = 2
 		}
 	}
-	// Browser Turnstile: serial-ish mint (original holds Physical_Sem per solve).
-	if strings.EqualFold(cfg.TurnstileProvider, "browser") || cfg.TurnstileProvider == "" {
-		s = 1
-		phys = 1 // one browser solve at a time — matches Python holding Physical_Sem
+	// Browser Turnstile: parallel slots from runtime --thread (not config.env).
+	prov := strings.ToLower(strings.TrimSpace(cfg.TurnstileProvider))
+	if prov == "" || prov == "browser" || prov == "local" || prov == "playwright" || prov == "pool" {
+		s = cfg.TurnstileWorkers
+		if s <= 0 {
+			s = 2
+		}
+		if s > 8 {
+			s = 8
+		}
+		if s < 1 {
+			s = 1
+		}
+		// phys caps concurrent browser mints (= pool slots)
+		if cfg.PhysicalCap > 0 && cfg.PhysicalCap < s {
+			s = cfg.PhysicalCap
+		}
+		phys = s
 	} else {
 		s = phys
+		if cfg.TurnstileWorkers > 0 {
+			s = cfg.TurnstileWorkers
+		}
 	}
-	// P workers: don't spawn 8 when target is 5 (was flooding tempmail).
+	// P workers: track --thread (S). Fixed P=4 with S=3 flooded reserved queue.
 	target := cfg.Target
 	if target <= 0 {
 		target = 10
 	}
-	p = target
+	if s < 1 {
+		s = 1
+	}
+	p = s
 	if p > 4 {
 		p = 4
+	}
+	if p > target {
+		p = target
 	}
 	if p < 1 {
 		p = 1
 	}
 	c = 2
-	if target < 2 {
+	if target < 2 || s < 2 {
 		c = 1
 	}
-	oa = 2
-	if s < 1 {
-		s = 1
+	// OAuth: default 1 when register concurrency ≥3 (device/auth 429); else 2.
+	oa = cfg.OAuthWorkers
+	if oa <= 0 {
+		if s >= 3 || target >= 8 {
+			oa = 1
+		} else {
+			oa = 2
+		}
+	}
+	if oa > 4 {
+		oa = 4
+	}
+	if oa < 1 {
+		oa = 1
 	}
 	return
 }

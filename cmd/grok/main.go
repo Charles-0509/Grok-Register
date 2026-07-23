@@ -5,11 +5,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/grok-free-register/grok-reg/internal/clearance"
 	"github.com/grok-free-register/grok-reg/internal/config"
 	"github.com/grok-free-register/grok-reg/internal/cpa"
 	"github.com/grok-free-register/grok-reg/internal/daemon"
@@ -18,6 +20,14 @@ import (
 	"github.com/grok-free-register/grok-reg/internal/pipeline"
 	"github.com/grok-free-register/grok-reg/internal/state"
 )
+
+func runCmd(bin string, args ...string) error {
+	cmd := exec.Command(bin, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
 
 func main() {
 	args := os.Args[1:]
@@ -59,6 +69,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 			os.Exit(1)
 		}
+	case "config":
+		if err := cmdConfig(); err != nil {
+			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+			os.Exit(1)
+		}
 	case "help", "-h", "--help":
 		printHelp()
 	case "version", "-v", "--version":
@@ -74,15 +89,29 @@ func printHelp() {
 	fmt.Print(`grok — Grok 注册 + OAuth 二合一 CLI
 
 用法:
-  grok start [-t N]   后台启动注册机；N=目标账号数(1-10000)，默认 10
-  grok status         查看运行状态与进度
-  grok stop           立即停止注册机
-  grok logs [-f]      查看最近一次运行日志；-f 实时跟踪
-  grok upload         选择最近 run 的 CPA JSON 上传到 Management API
-  grok help           显示帮助
+  grok start                      交互：询问注册数量与并发线程(1-8)
+  grok start -t N --thread M      目标 N 个 CPA 成功；M 并发线程
+  grok start -t N -j M            同上（-j 为 --thread 简写）
+  grok status                     查看运行状态与进度
+  grok stop                       立即停止注册机
+  grok logs [-f] [--debug|--info|--warn|--error]
+                                  查看最近一次运行日志；-f 实时跟踪
+  grok upload                     选择最近 run 的 CPA JSON 上传到 Management API
+  grok config                     打开 ~/.grok/config.env（并刷新 config.env.example）
+  grok help                       显示帮助
+
+说明:
+  -t / --target   目标账号数 = 探活成功写入 CPA/ 的数量 (1-10000)
+  --thread / -j   并发注册/Turnstile 线程数 (1-8)，默认交互回车=2（较稳）
+  logs 等级:      默认 --info（隐藏 DBG）；--debug 显示全部；--warn / --error 更严
+                  例: grok logs -f --debug
+  默认节奏:       OAUTH_MIN_INTERVAL_SEC=6  PROBE_WARMUP_SEC=5  OAUTH_RETRY_SEC=60
+  升级后请查看 ~/.grok/config.env.example 了解新增配置项
 
 数据目录: ~/.grok/ (可用 GROK_HOME 覆盖)
-输出:     ~/.grok/outputs/<yyyymmdd-HHMMSS>/{SSO,CPA}/
+  输出:     ~/.grok/outputs/<yyyymmdd-HHMMSS>/{SSO,CPA,grok2api}/
+            grok2api/tokens.txt = 单行 SSO token（无密码，供 grok2api）
+  grok stop 在 CLEARANCE_AUTO_STOP=1 时会同时 docker compose stop 清障栈
 `)
 }
 
@@ -98,7 +127,10 @@ func paths() (home.Paths, error) {
 }
 
 func cmdStart(args []string) error {
-	target := 10
+	target := 0
+	threads := 0
+	targetSet, threadSet := false, false
+
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -114,9 +146,23 @@ func cmdStart(args []string) error {
 			if err != nil {
 				return err
 			}
+			targetSet = true
 			i++
-		case strings.HasPrefix(a, "-t"):
-			// -t10
+		case a == "--thread" || a == "--threads" || a == "-j":
+			if i+1 >= len(args) {
+				return fmt.Errorf("%s 需要数字参数 (1-8)", a)
+			}
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				return fmt.Errorf("无效线程数: %s", args[i+1])
+			}
+			threads, err = config.ClampThreads(n)
+			if err != nil {
+				return err
+			}
+			threadSet = true
+			i++
+		case strings.HasPrefix(a, "-t") && len(a) > 2 && a[2] >= '0' && a[2] <= '9':
 			n, err := strconv.Atoi(strings.TrimPrefix(a, "-t"))
 			if err != nil {
 				return fmt.Errorf("无效 -t: %s", a)
@@ -125,8 +171,19 @@ func cmdStart(args []string) error {
 			if err != nil {
 				return err
 			}
+			targetSet = true
+		case strings.HasPrefix(a, "-j") && len(a) > 2:
+			n, err := strconv.Atoi(strings.TrimPrefix(a, "-j"))
+			if err != nil {
+				return fmt.Errorf("无效 -j: %s", a)
+			}
+			threads, err = config.ClampThreads(n)
+			if err != nil {
+				return err
+			}
+			threadSet = true
 		default:
-			return fmt.Errorf("未知参数: %s", a)
+			return fmt.Errorf("未知参数: %s（用法: grok start -t N --thread M）", a)
 		}
 	}
 
@@ -134,25 +191,62 @@ func cmdStart(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Always refresh example so upgrades surface new keys.
+	_ = config.SyncExample(p.Root)
 
 	// already running?
 	if pid, err := daemon.ReadPID(p.PID); err == nil && daemon.PIDAlive(pid) {
 		return fmt.Errorf("注册机已经在运行 (PID %d)，先 grok status / grok stop", pid)
 	}
 
-	// config
+	// config (email mode etc.)
 	if _, err := os.Stat(p.Config); os.IsNotExist(err) {
 		if _, err := config.InteractiveSetup(p.Config); err != nil {
 			return err
 		}
 	}
 
+	// Interactive prompts when flags omitted
+	reader := bufio.NewReader(os.Stdin)
+	if !targetSet {
+		fmt.Print("注册数量 (探活成功计 1，1-10000) [10]: ")
+		line, _ := reader.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line == "" {
+			target = 10
+		} else {
+			n, err := strconv.Atoi(line)
+			if err != nil {
+				return fmt.Errorf("无效数量: %s", line)
+			}
+			target, err = config.ClampTarget(n)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if !threadSet {
+		fmt.Print("并发线程数 (Turnstile/注册并行，1-8) [2]: ")
+		line, _ := reader.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line == "" {
+			threads = 2
+		} else {
+			n, err := strconv.Atoi(line)
+			if err != nil {
+				return fmt.Errorf("无效线程数: %s", line)
+			}
+			threads, err = config.ClampThreads(n)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	runID := home.NewRunID()
-	// prepare log path early (dirs created fully in worker before first write)
 	_ = os.MkdirAll(p.LogsDir, 0o700)
 	logPath := filepath.Join(p.LogsDir, fmt.Sprintf("run-%s.log", runID))
 
-	// seed state
 	st := state.NewStore(p.State)
 	_ = st.Set(func(s *state.Snapshot) {
 		s.Status = state.StatusRunning
@@ -161,13 +255,14 @@ func cmdStart(args []string) error {
 		s.Done = 0
 		s.Phase = state.PhaseIdle
 		s.PhaseDetail = "启动中"
+		s.Workers = state.Workers{S: threads}
 		s.LogPath = logPath
 		s.OutputDir = filepath.Join(p.Outputs, runID)
 		s.Error = ""
 		s.PID = 0
 	})
 
-	pid, err := daemon.StartBackground(target, runID)
+	pid, err := daemon.StartBackground(target, threads, runID)
 	if err != nil {
 		return err
 	}
@@ -179,15 +274,83 @@ func cmdStart(args []string) error {
 	fmt.Printf("[✓] 注册机已后台启动\n")
 	fmt.Printf("    PID:    %d\n", pid)
 	fmt.Printf("    目标:   %d\n", target)
+	fmt.Printf("    线程:   %d\n", threads)
 	fmt.Printf("    Run:    %s\n", runID)
 	fmt.Printf("    日志:   %s\n", logPath)
 	fmt.Printf("    输出:   %s\n", filepath.Join(p.Outputs, runID))
-	fmt.Printf("    查看:   grok status  |  grok logs -f\n")
+	fmt.Printf("    配置:   %s  |  示例: %s\n", p.Config, config.ExamplePath(p.Root))
+	fmt.Printf("    查看:   grok status  |  grok logs -f  |  grok config\n")
 	return nil
+}
+
+func cmdConfig() error {
+	p, err := paths()
+	if err != nil {
+		return err
+	}
+	_ = config.SyncExample(p.Root)
+	// Ensure config exists
+	if _, err := os.Stat(p.Config); os.IsNotExist(err) {
+		if _, err := config.InteractiveSetup(p.Config); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("配置文件: %s\n", p.Config)
+	fmt.Printf("示例参考: %s（升级后自动刷新，含新增项说明）\n", config.ExamplePath(p.Root))
+
+	editor := strings.TrimSpace(os.Getenv("EDITOR"))
+	if editor == "" {
+		editor = strings.TrimSpace(os.Getenv("VISUAL"))
+	}
+	// Prefer common editors
+	candidates := []string{}
+	if editor != "" {
+		candidates = append(candidates, editor)
+	}
+	candidates = append(candidates, "nano", "vim", "vi", "nvim", "code", "open")
+	var lastErr error
+	for _, ed := range candidates {
+		// `open` is macOS; use -t for textedit or just open path
+		var cmd *os.File
+		_ = cmd
+		c := execEditor(ed, p.Config)
+		if c == nil {
+			continue
+		}
+		if err := c(); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	if lastErr != nil {
+		return fmt.Errorf("无法打开编辑器: %v；请手动编辑 %s", lastErr, p.Config)
+	}
+	return fmt.Errorf("未找到编辑器，请手动编辑 %s（可设置 EDITOR=nano）", p.Config)
+}
+
+func execEditor(editor, path string) func() error {
+	editor = strings.TrimSpace(editor)
+	if editor == "" {
+		return nil
+	}
+	// split simple "code -w" style
+	parts := strings.Fields(editor)
+	bin := parts[0]
+	args := append(parts[1:], path)
+	if bin == "open" {
+		// macOS: open with default app for .env, or TextEdit
+		args = []string{"-e", path}
+	}
+	return func() error {
+		// use os/exec via shelling — import already has no exec in main? need add
+		return runCmd(bin, args...)
+	}
 }
 
 func runWorker(args []string) error {
 	target := 10
+	threads := 2
 	runID := ""
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -202,6 +365,14 @@ func runWorker(args []string) error {
 				}
 				i++
 			}
+		case "--threads", "--thread":
+			if i+1 < len(args) {
+				n, _ := strconv.Atoi(args[i+1])
+				if n > 0 {
+					threads = n
+				}
+				i++
+			}
 		case "--run-id":
 			if i+1 < len(args) {
 				runID = args[i+1]
@@ -209,16 +380,28 @@ func runWorker(args []string) error {
 			}
 		}
 	}
-	target, err := config.ClampTarget(target)
+	var err error
+	target, err = config.ClampTarget(target)
 	if err != nil {
 		return err
+	}
+	threads, err = config.ClampThreads(threads)
+	if err != nil {
+		// tolerate edge: clamp silently
+		if threads < 1 {
+			threads = 1
+		}
+		if threads > 8 {
+			threads = 8
+		}
 	}
 
 	p, err := paths()
 	if err != nil {
 		return err
 	}
-	// hold lock for process lifetime
+	_ = config.SyncExample(p.Root)
+
 	unlock, err := daemon.TryLock(p.Lock)
 	if err != nil {
 		return err
@@ -235,18 +418,17 @@ func runWorker(args []string) error {
 		return err
 	}
 	cfg.Target = target
+	cfg.TurnstileWorkers = threads
 
 	run, err := p.PrepareRun(runID)
 	if err != nil {
 		return err
 	}
-	// open log: only file (daemon has no tty)
 	log, err := logx.New(run.LogPath)
 	if err != nil {
 		return err
 	}
 	defer log.Close()
-	// worker: log to file only by reopening — logx multiwriter includes stdout; OK for journal
 
 	st := state.NewStore(p.State)
 	_ = st.Set(func(s *state.Snapshot) {
@@ -256,6 +438,7 @@ func runWorker(args []string) error {
 		s.PID = os.Getpid()
 		s.LogPath = run.LogPath
 		s.OutputDir = run.Root
+		s.Workers = state.Workers{S: threads}
 	})
 
 	ctx := context.Background()
@@ -329,14 +512,83 @@ func cmdStop() error {
 		s.PID = 0
 	})
 	fmt.Println("[✓] 注册机已停止")
+	// Worker may be SIGKILL'd before pipeline defer; always stop clearance when configured.
+	stopClearanceStackOnStop(p)
 	return nil
+}
+
+// stopClearanceStackOnStop mirrors CLEARANCE_AUTO_STOP for manual `grok stop`.
+func stopClearanceStackOnStop(p home.Paths) {
+	cfg, err := config.Load(p.Config)
+	if err != nil {
+		// Defaults: auto-stop on
+		cfg = config.Defaults()
+	}
+	if !cfg.ClearanceAutoStop || !cfg.ClearanceEnabled {
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(cfg.ClearanceMode))
+	if mode == "never" {
+		return
+	}
+	msg, err := clearance.StopStack(cfg.ClearanceComposeDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] 清障栈停止失败: %v\n", err)
+		return
+	}
+	if msg != "" {
+		fmt.Printf("[✓] %s\n", msg)
+	}
 }
 
 func cmdLogs(args []string) error {
 	follow := false
-	for _, a := range args {
-		if a == "-f" || a == "--follow" {
+	minLevel := logx.LevelInfo // default: hide DBG
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-f" || a == "--follow":
 			follow = true
+		case a == "--debug" || a == "-d" || a == "--verbose" || a == "-v":
+			minLevel = logx.LevelDebug
+		case a == "--info" || a == "-i":
+			minLevel = logx.LevelInfo
+		case a == "--warn" || a == "--warning" || a == "-w":
+			minLevel = logx.LevelWarn
+		case a == "--error" || a == "--err" || a == "-e":
+			minLevel = logx.LevelError
+		case a == "--level" || a == "-l":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--level 需要参数: debug|info|warn|error")
+			}
+			i++
+			lv, err := logx.ParseLevel(args[i])
+			if err != nil {
+				return err
+			}
+			minLevel = lv
+		case strings.HasPrefix(a, "--level="):
+			lv, err := logx.ParseLevel(strings.TrimPrefix(a, "--level="))
+			if err != nil {
+				return err
+			}
+			minLevel = lv
+		case a == "-h" || a == "--help":
+			fmt.Print(`grok logs — 查看 / 跟踪运行日志
+
+用法:
+  grok logs                     打印最近日志（默认 ≥ info，隐藏 DBG）
+  grok logs -f                  实时跟踪
+  grok logs -f --debug          显示 DBG 及全部
+  grok logs --warn              仅警告与错误
+  grok logs --level=error       仅错误
+  grok logs -l debug -f         同上
+
+说明: 磁盘日志始终完整写入；等级只过滤终端显示。
+`)
+			return nil
+		default:
+			return fmt.Errorf("未知 logs 参数: %s（见 grok logs --help）", a)
 		}
 	}
 	p, err := paths()
@@ -347,29 +599,45 @@ func cmdLogs(args []string) error {
 	snap, _ := st.Load()
 	path := snap.LogPath
 	if path == "" {
-		// pick latest in logs dir
 		path = latestLog(p.LogsDir)
 	}
 	if path == "" {
 		return fmt.Errorf("没有日志文件")
 	}
+	levelName := "info"
+	switch {
+	case minLevel <= logx.LevelDebug:
+		levelName = "debug"
+	case minLevel <= logx.LevelInfo:
+		levelName = "info"
+	case minLevel <= logx.LevelWarn:
+		levelName = "warn"
+	default:
+		levelName = "error"
+	}
+
 	if !follow {
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		fmt.Print(string(data))
+		fmt.Print(logx.FilterText(string(data), minLevel))
 		return nil
 	}
-	fmt.Fprintf(os.Stderr, "跟踪 %s (Ctrl-C 退出)\n", path)
+	fmt.Fprintf(os.Stderr, "跟踪 %s  level≥%s  (Ctrl-C 退出)\n", path, levelName)
 	var offset int64
 	if fi, err := os.Stat(path); err == nil {
-		// show last 4k first
-		offset = fi.Size() - 4096
+		// show last ~8k then filter (more room when DBG hidden)
+		chunk := int64(8192)
+		if minLevel <= logx.LevelDebug {
+			chunk = 16384
+		}
+		offset = fi.Size() - chunk
 		if offset < 0 {
 			offset = 0
 		}
 	}
+	var carry string // incomplete line across reads
 	for {
 		f, err := os.Open(path)
 		if err != nil {
@@ -385,8 +653,19 @@ func cmdLogs(args []string) error {
 		for {
 			n, err := f.Read(buf)
 			if n > 0 {
-				_, _ = os.Stdout.Write(buf[:n])
 				offset += int64(n)
+				carry += string(buf[:n])
+				for {
+					i := strings.IndexByte(carry, '\n')
+					if i < 0 {
+						break
+					}
+					line := carry[:i]
+					carry = carry[i+1:]
+					if logx.KeepLine(line, minLevel) {
+						fmt.Println(line)
+					}
+				}
 			}
 			if err != nil {
 				break
@@ -528,4 +807,3 @@ func cmdUpload() error {
 	fmt.Printf("[✓] 完成 ok=%d fail=%d skip_runs=%d\n", okN, failN, skipN)
 	return nil
 }
-

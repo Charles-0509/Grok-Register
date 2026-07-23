@@ -1,8 +1,10 @@
-APP=grok
+# APP / 命令名可改：make install APP=grok-reg
+APP?=grok
 MODULE=github.com/grok-free-register/grok-reg
 VERSION?=0.1.0
 PREFIX?=/usr/local
-BINDIR=$(PREFIX)/bin
+BINDIR?=$(PREFIX)/bin
+SHAREDIR?=$(PREFIX)/share/grok-reg
 
 .PHONY: build install uninstall clean test run
 
@@ -20,21 +22,24 @@ build:
 	fi
 	$(GO) build -ldflags "-s -w -X main.version=$(VERSION)" -o bin/$(APP) ./cmd/grok
 
-# 不强制 rebuild：已有 bin/grok 时直接安装（避免 sudo 丢 PATH 再编一次失败）
+# 不强制 rebuild：已有 bin/$(APP) 时直接安装（避免 sudo 丢 PATH 再编一次失败）
 install:
 	@if [ ! -x bin/$(APP) ]; then \
 		echo "[*] bin/$(APP) 不存在，先 build..."; \
-		$(MAKE) build; \
+		$(MAKE) build APP=$(APP); \
 	fi
 	install -d $(BINDIR)
 	install -m 755 bin/$(APP) $(BINDIR)/$(APP)
-	# Playwright mint helper (Turnstile) — same path original project uses
-	install -d /usr/local/share/grok-reg
-	install -m 755 scripts/turnstile_mint.py /usr/local/share/grok-reg/turnstile_mint.py
+	# Playwright mint helpers (Turnstile) — one-shot + persistent pool
+	install -d $(SHAREDIR)
+	install -m 755 scripts/turnstile_mint.py $(SHAREDIR)/turnstile_mint.py
+	install -m 755 scripts/turnstile_pool.py $(SHAREDIR)/turnstile_pool.py
 	@echo "installed: $(BINDIR)/$(APP)"
-	@echo "installed: /usr/local/share/grok-reg/turnstile_mint.py"
-	@echo "try: grok help"
+	@echo "installed: $(SHAREDIR)/turnstile_mint.py"
+	@echo "installed: $(SHAREDIR)/turnstile_pool.py"
+	@echo "try: $(APP) help"
 	@echo "Turnstile: pip install -r scripts/requirements-turnstile.txt && python -m cloakbrowser install"
+	@echo "一键部署: scripts/install.sh --help"
 
 uninstall:
 	rm -f $(BINDIR)/$(APP)

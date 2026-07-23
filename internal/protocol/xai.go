@@ -3,40 +3,54 @@ package protocol
 import (
 	"bytes"
 	"compress/gzip"
-	"crypto/tls"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
-	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	mrand "math/rand"
-	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	http "github.com/bogdanfinn/fhttp"
+
 	"github.com/grok-free-register/grok-reg/internal/clearance"
 )
 
 const (
-	SiteURL              = "https://accounts.x.ai"
-	ConnectCreate        = SiteURL + "/auth_mgmt.AuthManagement/CreateEmailValidationCode"
-	ConnectVerify        = SiteURL + "/auth_mgmt.AuthManagement/VerifyEmailValidationCode"
-	SignupURLGrok        = SiteURL + "/sign-up?redirect=grok-com"
-	DefaultUserAgent     = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+	SiteURL       = "https://accounts.x.ai"
+	ConnectCreate = SiteURL + "/auth_mgmt.AuthManagement/CreateEmailValidationCode"
+	ConnectVerify = SiteURL + "/auth_mgmt.AuthManagement/VerifyEmailValidationCode"
+	ConnectPass   = SiteURL + "/auth_mgmt.AuthManagement/ValidatePassword"
+	SignupURLGrok = SiteURL + "/sign-up?redirect=grok-com"
+	DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+	// Document-aligned Next.js router state tree (URL-encoded at use).
+	DefaultRouterStateTreeJSON = `["",{"children":["(app)",{"children":["(auth)",{"children":["sign-up",{"children":["__PAGE__",{},null,null,0]},null,null,0]},null,null,0]},null,null,0]},null,null,16]`
+	// Fallback next-action id (scraped at runtime when possible).
+	DefaultNextAction = "7f7f6cee188bd9cc17a3fb9dbde4abe224f21af0e3"
 )
 
 var (
-	siteKeyRe  = regexp.MustCompile(`0x4AAAAAAA[a-zA-Z0-9_-]+`)
-	jsSrcRe    = regexp.MustCompile(`src="(/_next/static/[^"]+\.js)"`)
-	hex40Re    = regexp.MustCompile(`[a-fA-F0-9]{40,50}`)
-	flightRe   = regexp.MustCompile(`self\.__next_f\.push\(\[1,"(.*?)"\]\)`)
+	siteKeyRe = regexp.MustCompile(`0x4AAAAAAA[a-zA-Z0-9_-]+`)
+	jsSrcRe   = regexp.MustCompile(`src="(/_next/static/[^"]+\.js)"`)
+	hex40Re   = regexp.MustCompile(`[a-fA-F0-9]{40,50}`)
+	flightRe  = regexp.MustCompile(`self\.__next_f\.push\(\[1,"(.*?)"\]\)`)
 )
+
+// ClientOptions configures protocol HTTP client.
+type ClientOptions struct {
+	Proxy            string
+	Clearance        *clearance.Manager
+	Impersonate      string   // e.g. chrome_131
+	ImpersonateFallback []string
+	Timeout          time.Duration
+}
 
 type SignupConfig struct {
 	SiteKey   string
@@ -46,55 +60,79 @@ type SignupConfig struct {
 }
 
 type Client struct {
-	http    *http.Client
+	sess    *Session
 	proxy   string
 	clear   *clearance.Manager
 	ua      string
+	profile string
 	mu      sync.Mutex
 	cfg     SignupConfig
 }
 
 func NewClient(proxy string, cm *clearance.Manager) (*Client, error) {
-	jar, _ := cookiejar.New(nil)
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+	return NewClientOpts(ClientOptions{Proxy: proxy, Clearance: cm, Impersonate: "chrome_131"})
+}
+
+func NewClientOpts(opt ClientOptions) (*Client, error) {
+	profile := opt.Impersonate
+	if profile == "" {
+		profile = "chrome_131"
 	}
-	if proxy != "" {
-		u, err := url.Parse(proxy)
-		if err != nil {
-			return nil, err
-		}
-		transport.Proxy = http.ProxyURL(u)
+	timeout := opt.Timeout
+	if timeout <= 0 {
+		timeout = 45 * time.Second
+	}
+	sess, err := NewSession(opt.Proxy, profile, timeout)
+	if err != nil {
+		return nil, err
 	}
 	c := &Client{
-		http: &http.Client{
-			Timeout:   45 * time.Second,
-			Jar:       jar,
-			Transport: transport,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) >= 8 {
-					return fmt.Errorf("too many redirects")
-				}
-				return nil
-			},
-		},
-		proxy: proxy,
-		clear: cm,
-		ua:    DefaultUserAgent,
+		sess:    sess,
+		proxy:   opt.Proxy,
+		clear:   opt.Clearance,
+		ua:      DefaultUserAgent,
+		profile: sess.ProfileName(),
 	}
-	if cm != nil {
-		c.ua = cm.UserAgent()
+	if opt.Clearance != nil {
+		if ua := opt.Clearance.UserAgent(); ua != "" {
+			c.ua = ua
+			sess.SetUserAgent(ua)
+		}
 		c.applyClearanceCookies()
 	}
+	_ = opt.ImpersonateFallback
 	return c, nil
 }
 
+// Profile returns active TLS impersonation name.
+func (c *Client) Profile() string {
+	if c == nil {
+		return ""
+	}
+	return c.profile
+}
+
+// RecreateWithProfile rebuilds the TLS session with a different impersonate profile.
+func (c *Client) RecreateWithProfile(profile string) error {
+	if c == nil {
+		return fmt.Errorf("nil client")
+	}
+	sess, err := NewSession(c.proxy, profile, 45*time.Second)
+	if err != nil {
+		return err
+	}
+	c.sess = sess
+	c.profile = sess.ProfileName()
+	sess.SetUserAgent(c.ua)
+	c.applyClearanceCookies()
+	return nil
+}
+
 func (c *Client) applyClearanceCookies() {
-	if c.clear == nil {
+	if c.clear == nil || c.sess == nil {
 		return
 	}
 	b := c.clear.Get()
-	u, _ := url.Parse(SiteURL)
 	var cookies []*http.Cookie
 	for _, ck := range b.Cookies {
 		cookies = append(cookies, &http.Cookie{
@@ -105,10 +143,11 @@ func (c *Client) applyClearanceCookies() {
 		})
 	}
 	if len(cookies) > 0 {
-		c.http.Jar.SetCookies(u, cookies)
+		c.sess.SetCookies(SiteURL, cookies)
 	}
 	if b.UserAgent != "" {
 		c.ua = b.UserAgent
+		c.sess.SetUserAgent(b.UserAgent)
 	}
 }
 
@@ -118,33 +157,49 @@ func (c *Client) Config() SignupConfig {
 	return c.cfg
 }
 
-func (c *Client) FetchConfig() (SignupConfig, error) {
+// WarmSignup GETs sign-up page; used for CF probe and config scrape.
+func (c *Client) WarmSignup() (status int, body string, err error) {
 	c.applyClearanceCookies()
-	req, err := http.NewRequest(http.MethodGet, SignupURLGrok, nil)
+	req, err := NewRequest(http.MethodGet, SignupURLGrok, nil)
 	if err != nil {
-		return SignupConfig{}, err
+		return 0, "", err
 	}
 	c.setBrowserHeaders(req)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
 	req.Header.Set("Referer", "https://grok.com/")
-	resp, err := c.http.Do(req)
+	resp, err := c.sess.Do(req)
 	if err != nil {
-		return SignupConfig{}, err
+		return 0, "", Wrap(CodeWarm, "GET sign-up", err)
 	}
-	defer resp.Body.Close()
 	html, err := readBody(resp)
 	if err != nil {
+		return resp.StatusCode, "", err
+	}
+	return resp.StatusCode, html, nil
+}
+
+func (c *Client) FetchConfig() (SignupConfig, error) {
+	status, html, err := c.WarmSignup()
+	if err != nil {
 		return SignupConfig{}, err
 	}
-	cfg := SignupConfig{Source: fmt.Sprintf("http status=%d", resp.StatusCode)}
-	if resp.StatusCode != 200 || isCloudflare(resp.StatusCode, html, resp.Header) {
+	cfg := SignupConfig{Source: fmt.Sprintf("http status=%d profile=%s", status, c.profile)}
+	if status != 200 || isCloudflare(status, html, nil) {
 		cfg.Source += " (blocked_or_empty)"
-		return cfg, fmt.Errorf("signup page blocked status=%d", resp.StatusCode)
+		code := CodeCFBlocked
+		if status == 403 {
+			code = CodeCF403
+		}
+		return cfg, Failf(code, "signup page blocked status=%d profile=%s", status, c.profile)
 	}
 	if m := siteKeyRe.FindString(html); m != "" {
 		cfg.SiteKey = m
 	}
 	cfg.StateTree = scrapeStateTree(html)
+	if cfg.StateTree == "" {
+		cfg.StateTree = url.QueryEscape(DefaultRouterStateTreeJSON)
+		cfg.Source += "+default_tree"
+	}
 	jsURLs := unique(jsSrcRe.FindAllStringSubmatch(html, -1))
 	for _, path := range jsURLs {
 		if cfg.ActionID != "" {
@@ -159,10 +214,19 @@ func (c *Client) FetchConfig() (SignupConfig, error) {
 		}
 		if hexes := hex40Re.FindAllString(js, -1); len(hexes) > 0 {
 			cfg.ActionID = hexes[0]
+			cfg.Source += "+scrape_action"
 		}
 	}
+	if cfg.ActionID == "" {
+		cfg.ActionID = DefaultNextAction
+		cfg.Source += "+default_action"
+	}
+	if cfg.SiteKey == "" {
+		cfg.SiteKey = "0x4AAAAAAAhr9JGVDZbrZOo0"
+		cfg.Source += "+default_sitekey"
+	}
 	if cfg.SiteKey == "" || cfg.ActionID == "" || cfg.StateTree == "" {
-		return cfg, fmt.Errorf("config incomplete site_key=%v action=%v state=%v", cfg.SiteKey != "", cfg.ActionID != "", cfg.StateTree != "")
+		return cfg, Failf(CodeConfig, "config incomplete site_key=%v action=%v state=%v", cfg.SiteKey != "", cfg.ActionID != "", cfg.StateTree != "")
 	}
 	c.mu.Lock()
 	c.cfg = cfg
@@ -171,72 +235,102 @@ func (c *Client) FetchConfig() (SignupConfig, error) {
 }
 
 func (c *Client) fetchJS(path string) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, SiteURL+path, nil)
+	req, err := NewRequest(http.MethodGet, SiteURL+path, nil)
 	if err != nil {
 		return "", err
 	}
 	c.setBrowserHeaders(req)
 	req.Header.Set("Referer", SignupURLGrok)
-	resp, err := c.http.Do(req)
+	resp, err := c.sess.Do(req)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
 	return readBody(resp)
 }
 
+// CreateEmailCode sends gRPC-Web CreateEmailValidationCode.
+// castleToken may be empty (current strategy).
 func (c *Client) CreateEmailCode(email string) error {
+	return c.CreateEmailCodeCastle(email, "")
+}
+
+func (c *Client) CreateEmailCodeCastle(email, castleToken string) error {
 	inner := pbStr(1, email)
+	if castleToken != "" {
+		inner = append(inner, pbStr(3, castleToken)...)
+	}
 	frame := grpcWebFrame(inner)
-	req, err := http.NewRequest(http.MethodPost, ConnectCreate, bytes.NewReader(frame))
+	req, err := NewRequest(http.MethodPost, ConnectCreate, bytes.NewReader(frame))
 	if err != nil {
 		return err
 	}
 	c.setGRPCHeaders(req)
-	resp, err := c.http.Do(req)
+	resp, err := c.sess.Do(req)
 	if err != nil {
-		return err
+		return Wrap(CodeGRPCCreate, "create email", err)
 	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	st := resp.Header.Get("grpc-status")
+	body, _ := readAllBody(resp)
+	st := readGRPCStatus(resp, body)
 	if st == "" {
 		st = "0"
 	}
 	if resp.StatusCode != 200 || (st != "0" && st != "") {
-		return fmt.Errorf("create email http=%d grpc=%s", resp.StatusCode, st)
+		return Failf(CodeGRPCCreate, "create email http=%d grpc=%s profile=%s", resp.StatusCode, st, c.profile)
 	}
 	return nil
 }
 
 func (c *Client) VerifyEmailCode(email, code string) error {
+	code = strings.NewReplacer("-", "", " ", "").Replace(code)
 	inner := append(pbStr(1, email), pbStr(2, code)...)
 	frame := grpcWebFrame(inner)
-	req, err := http.NewRequest(http.MethodPost, ConnectVerify, bytes.NewReader(frame))
+	req, err := NewRequest(http.MethodPost, ConnectVerify, bytes.NewReader(frame))
 	if err != nil {
 		return err
 	}
 	c.setGRPCHeaders(req)
-	resp, err := c.http.Do(req)
+	resp, err := c.sess.Do(req)
 	if err != nil {
-		return err
+		return Wrap(CodeGRPCVerify, "verify email", err)
 	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	st := resp.Header.Get("grpc-status")
+	body, _ := readAllBody(resp)
+	st := readGRPCStatus(resp, body)
 	if st == "" {
 		st = "0"
 	}
 	if resp.StatusCode != 200 || (st != "0" && st != "") {
-		return fmt.Errorf("verify email http=%d grpc=%s", resp.StatusCode, st)
+		return Failf(CodeGRPCVerify, "verify email http=%d grpc=%s", resp.StatusCode, st)
+	}
+	return nil
+}
+
+// ValidatePassword optional gRPC step (field 4 email, 5 password). Non-fatal for callers.
+func (c *Client) ValidatePassword(email, password string) error {
+	inner := append(pbStr(4, email), pbStr(5, password)...)
+	frame := grpcWebFrame(inner)
+	req, err := NewRequest(http.MethodPost, ConnectPass, bytes.NewReader(frame))
+	if err != nil {
+		return err
+	}
+	c.setGRPCHeaders(req)
+	resp, err := c.sess.Do(req)
+	if err != nil {
+		return Wrap(CodeGRPCPassword, "validate password", err)
+	}
+	body, _ := readAllBody(resp)
+	st := readGRPCStatus(resp, body)
+	if st == "" {
+		st = "0"
+	}
+	if resp.StatusCode != 200 || (st != "0" && st != "") {
+		return Failf(CodeGRPCPassword, "validate password http=%d grpc=%s", resp.StatusCode, st)
 	}
 	return nil
 }
 
 // SignupServerAction posts Next.js server action body; returns response text and SSO cookie if set.
 func (c *Client) SignupServerAction(body []byte, actionID, stateTree string) (string, string, error) {
-	// POST must match scraped state tree (redirect=grok-com).
-	req, err := http.NewRequest(http.MethodPost, SignupURLGrok, bytes.NewReader(body))
+	req, err := NewRequest(http.MethodPost, SignupURLGrok, bytes.NewReader(body))
 	if err != nil {
 		return "", "", err
 	}
@@ -247,16 +341,13 @@ func (c *Client) SignupServerAction(body []byte, actionID, stateTree string) (st
 	req.Header.Set("Next-Router-State-Tree", stateTree)
 	req.Header.Set("Origin", SiteURL)
 	req.Header.Set("Referer", SignupURLGrok)
-	resp, err := c.http.Do(req)
+	resp, err := c.sess.Do(req)
 	if err != nil {
-		return "", "", err
+		return "", "", Wrap(CodeSignup, "signup action", err)
 	}
-	defer resp.Body.Close()
 	text, _ := readBody(resp)
 
-	// 1) Direct Set-Cookie sso on the action response (session JWT only).
 	sso := sessionSSOFromCookies(resp.Cookies())
-	// 2) Follow set-cookie hop chain from RSC body (required path for most accounts).
 	if !isSessionSSO(sso) {
 		for _, hop := range expandSSOHopURLs(extractAllSetCookieURLs(text)) {
 			if v, err := c.followSSOHop(hop); err == nil && isSessionSSO(v) {
@@ -265,11 +356,9 @@ func (c *Client) SignupServerAction(body []byte, actionID, stateTree string) (st
 			}
 		}
 	}
-	// 3) Jar after hops (accounts.x.ai / .x.ai).
 	if !isSessionSSO(sso) {
 		sso = c.jarSSO()
 	}
-	// 4) Explicit sso=JWT in body (not hop config JWT).
 	if !isSessionSSO(sso) {
 		if m := ExtractSSOFromText(text); isSessionSSO(m) {
 			sso = m
@@ -279,12 +368,14 @@ func (c *Client) SignupServerAction(body []byte, actionID, stateTree string) (st
 		sso = ""
 	}
 	if resp.StatusCode >= 400 {
-		return text, sso, fmt.Errorf("signup http=%d body=%s", resp.StatusCode, truncate(text, 200))
+		return text, sso, Failf(CodeSignup, "signup http=%d body=%s", resp.StatusCode, truncate(text, 200))
+	}
+	if sso == "" {
+		return text, "", Failf(CodeSignupNoSSO, "signup ok but no session sso hops=%d", len(extractAllSetCookieURLs(text)))
 	}
 	return text, sso, nil
 }
 
-// followSSOHop walks set-cookie redirects manually so intermediate Set-Cookie is kept.
 func (c *Client) followSSOHop(start string) (string, error) {
 	hops := expandSSOHopURLs([]string{start})
 	seen := map[string]struct{}{}
@@ -298,7 +389,7 @@ func (c *Client) followSSOHop(start string) (string, error) {
 		}
 		seen[hop] = struct{}{}
 
-		req, err := http.NewRequest(http.MethodGet, hop, nil)
+		req, err := NewRequest(http.MethodGet, hop, nil)
 		if err != nil {
 			continue
 		}
@@ -310,17 +401,11 @@ func (c *Client) followSSOHop(start string) (string, error) {
 		req.Header.Set("Sec-Fetch-Dest", "document")
 		req.Header.Set("Upgrade-Insecure-Requests", "1")
 
-		// Manual redirect walk — auto-follow can drop intermediate sso cookies.
-		client := *c.http
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-		resp, err := client.Do(req)
+		resp, err := c.sess.DoNoRedirect(req)
 		if err != nil {
 			continue
 		}
 		body, _ := readBody(resp)
-		_ = resp.Body.Close()
 
 		if v := sessionSSOFromCookies(resp.Cookies()); isSessionSSO(v) {
 			return v, nil
@@ -356,9 +441,8 @@ func (c *Client) followSSOHop(start string) (string, error) {
 }
 
 func (c *Client) jarSSO() string {
-	for _, host := range []string{SiteURL, "https://x.ai", "https://auth.x.ai", "https://grok.com"} {
-		u, _ := url.Parse(host)
-		for _, ck := range c.http.Jar.Cookies(u) {
+	for _, host := range []string{SiteURL, "https://x.ai", "https://auth.x.ai", "https://grok.com", "https://auth.grokusercontent.com", "https://auth.grokipedia.com"} {
+		for _, ck := range c.sess.Cookies(host) {
 			if ck.Name == "sso" && isSessionSSO(ck.Value) {
 				return ck.Value
 			}
@@ -376,15 +460,12 @@ func sessionSSOFromCookies(cks []*http.Cookie) string {
 	return ""
 }
 
-// isSessionSSO rejects hop-config JWTs (config.token / success_url) used only for set-cookie URLs.
 func isSessionSSO(tok string) bool {
 	if tok == "" || !strings.HasPrefix(tok, "eyJ") || strings.Count(tok, ".") != 2 {
 		return false
 	}
-	// Hop config JWT payload contains success_url / config.token — not a session.
 	payload := jwtPayloadMap(tok)
 	if payload == nil {
-		// still accept long eyJ tokens if we can't decode (rare)
 		return len(tok) > 80
 	}
 	if cfg, ok := payload["config"].(map[string]any); ok {
@@ -398,7 +479,6 @@ func isSessionSSO(tok string) bool {
 	if _, ok := payload["success_url"]; ok {
 		return false
 	}
-	// Real session tokens typically carry sub / sid / session-ish claims or are long opaque JWTs.
 	return len(tok) > 40
 }
 
@@ -471,7 +551,6 @@ func extractAllSetCookieURLs(text string) []string {
 		}
 	}
 	if len(found) == 0 {
-		// reconstruct hop from bare JWT near set-cookie marker
 		if idx := strings.Index(strings.ToLower(body), "set-cookie"); idx >= 0 {
 			window := body[idx:]
 			if len(window) > 400 {
@@ -518,6 +597,9 @@ func expandSSOHopURLs(urls []string) []string {
 			}
 		}
 		add("https://auth.grokusercontent.com/set-cookie?q=" + jwt)
+		add("https://auth.grokipedia.com/set-cookie?q=" + jwt)
+		add("https://auth.grok.com/set-cookie?q=" + jwt)
+		add("https://auth.x.ai/set-cookie?q=" + jwt)
 	}
 	return out
 }
@@ -527,7 +609,6 @@ func jwtFromSetCookieURL(u string) string {
 	if err != nil {
 		raw = u
 	}
-	// ?q=eyJ...
 	if i := strings.Index(raw, "q="); i >= 0 {
 		rest := raw[i+2:]
 		if j := strings.IndexAny(rest, "&\"' "); j >= 0 {
@@ -541,32 +622,20 @@ func jwtFromSetCookieURL(u string) string {
 }
 
 func (c *Client) ClearAuthCookies() {
-	u, _ := url.Parse(SiteURL)
-	var keep []*http.Cookie
-	for _, ck := range c.http.Jar.Cookies(u) {
-		ln := strings.ToLower(ck.Name)
-		if ln == "sso" || ln == "sso-rw" {
-			continue
-		}
-		keep = append(keep, ck)
-	}
-	// Reset jar for host by setting empty — cookiejar doesn't delete easily;
-	// re-apply clearance only.
-	jar, _ := cookiejar.New(nil)
-	c.http.Jar = jar
+	// New jar via recreate session profile (keep TLS profile)
+	_ = c.RecreateWithProfile(c.profile)
 	c.applyClearanceCookies()
-	_ = keep
 }
 
 func (c *Client) setBrowserHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", c.ua)
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("sec-ch-ua", `"Chromium";v="146", "Google Chrome";v="146", "Not_A Brand";v="99"`)
+	req.Header.Set("sec-ch-ua", `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`)
 	req.Header.Set("sec-ch-ua-mobile", "?0")
-	req.Header.Set("sec-ch-ua-platform", `"Linux"`)
-	if h := c.clearCookieHeader(); h != "" && req.Header.Get("Cookie") == "" {
-		req.Header.Set("Cookie", h)
-	}
+	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+	req.Header.Set("sec-fetch-dest", "empty")
+	req.Header.Set("sec-fetch-mode", "cors")
+	req.Header.Set("sec-fetch-site", "same-origin")
 }
 
 func (c *Client) setGRPCHeaders(req *http.Request) {
@@ -579,13 +648,6 @@ func (c *Client) setGRPCHeaders(req *http.Request) {
 	req.Header.Set("Accept", "*/*")
 }
 
-func (c *Client) clearCookieHeader() string {
-	if c.clear == nil {
-		return ""
-	}
-	return c.clear.CookieHeader()
-}
-
 var givenNames = []string{
 	"James", "John", "Robert", "Michael", "William", "David", "Richard", "Joseph", "Thomas", "Charles",
 }
@@ -593,14 +655,16 @@ var familyNames = []string{
 	"Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez",
 }
 
-// BuildSignupBody matches grok_register/http_protocol.server_action_register lite shape.
-//
-//	[{ emailValidationCode, createUserAndSessionRequest, turnstileToken,
-//	   conversionId, castleRequestToken },
-//	 { client:"$T", meta:"$undefined", mutationKey:"$undefined" }]
+// BuildSignupBody builds Next server-action JSON.
+// castleToken empty = current production strategy.
 func BuildSignupBody(email, password, code, turnstileToken string) []byte {
+	return BuildSignupBodyCastle(email, password, code, turnstileToken, "")
+}
+
+func BuildSignupBodyCastle(email, password, code, turnstileToken, castleToken string) []byte {
 	given := givenNames[mrand.Intn(len(givenNames))]
 	family := familyNames[mrand.Intn(len(familyNames))]
+	// Document-aligned single-element array + tosAcceptedVersion:1
 	payload := []any{
 		map[string]any{
 			"emailValidationCode": code,
@@ -609,16 +673,11 @@ func BuildSignupBody(email, password, code, turnstileToken string) []byte {
 				"givenName":          given,
 				"familyName":         family,
 				"clearTextPassword":  password,
-				"tosAcceptedVersion": "$undefined",
+				"tosAcceptedVersion": 1,
 			},
 			"turnstileToken":     turnstileToken,
 			"conversionId":       randomUUID(),
-			"castleRequestToken": "",
-		},
-		map[string]any{
-			"client":      "$T",
-			"meta":        "$undefined",
-			"mutationKey": "$undefined",
+			"castleRequestToken": castleToken,
 		},
 	}
 	raw, err := json.Marshal(payload)
@@ -699,17 +758,21 @@ func scrapeStateTree(html string) string {
 func isCloudflare(status int, body string, h http.Header) bool {
 	if status == 403 || status == 503 {
 		low := strings.ToLower(body)
-		if strings.Contains(low, "cf-") || strings.Contains(low, "cloudflare") || strings.Contains(low, "just a moment") {
+		if strings.Contains(low, "cf-") || strings.Contains(low, "cloudflare") || strings.Contains(low, "just a moment") || strings.Contains(low, "attention required") {
 			return true
 		}
 	}
-	if strings.Contains(strings.ToLower(h.Get("Server")), "cloudflare") && status >= 400 {
+	if h != nil && strings.Contains(strings.ToLower(h.Get("Server")), "cloudflare") && status >= 400 {
 		return true
 	}
 	return false
 }
 
 func readBody(resp *http.Response) (string, error) {
+	if resp == nil || resp.Body == nil {
+		return "", nil
+	}
+	defer resp.Body.Close()
 	var r io.Reader = resp.Body
 	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
 		gz, err := gzip.NewReader(resp.Body)
@@ -748,12 +811,10 @@ func truncate(s string, n int) string {
 // ExtractSSOFromText finds an embedded sso=JWT (session) in RSC/HTML body.
 func ExtractSSOFromText(text string) string {
 	body := normalizeRSC(text)
-	// sso=eyJ...
 	reNamed := regexp.MustCompile(`(?i)(?:^|[;,\s'"\\])sso=(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)`)
 	if m := reNamed.FindStringSubmatch(body); len(m) > 1 && isSessionSSO(m[1]) {
 		return m[1]
 	}
-	// near session/sso markers
 	reNear := regexp.MustCompile(`(?i)(?:sso|session)[^e]{0,40}(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)`)
 	if m := reNear.FindStringSubmatch(body); len(m) > 1 && isSessionSSO(m[1]) {
 		return m[1]

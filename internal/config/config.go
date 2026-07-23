@@ -2,16 +2,22 @@ package config
 
 import (
 	"bufio"
+	_ "embed"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
+
+//go:embed example.env
+var embeddedExample string
 
 type EmailMode string
 
 const (
 	EmailTempmail EmailMode = "tempmail"
+	EmailTestmail EmailMode = "testmail"
 	EmailCustom   EmailMode = "custom"
 )
 
@@ -20,17 +26,38 @@ type Config struct {
 	EmailDomain string
 	EmailAPI    string
 
+	// testmail.app (GitHub Student Pack Essential etc.)
+	TestmailAPIKey    string
+	TestmailNamespace string
+	TestmailDomain    string // default inbox.testmail.app
+
 	ClearanceEnabled bool
-	RegisterProxy    string
-	FlareSolverrURL  string
-	ClearanceProxy   string
-	ClearanceURLs    string
+	// ClearanceMode: auto | always | never
+	// auto = protocol TLS first; start stack only on CF block
+	// always = EnsureStack when ClearanceEnabled
+	// never = never touch docker clearance
+	ClearanceMode string
+	// ClearanceAutoStop: after run ends or is interrupted, docker compose stop clearance stack.
+	ClearanceAutoStop bool
+	// ClearanceComposeDir optional override (else GROK_CLEARANCE_DIR / discover).
+	ClearanceComposeDir string
+	RegisterProxy       string
+	FlareSolverrURL     string
+	ClearanceProxy      string
+	ClearanceURLs       string
 
-	Target      int
-	PhysicalCap int
+	// CF TLS impersonation (bogdanfinn/tls-client profiles)
+	CFImpersonate         string // chrome_131
+	CFImpersonateFallback string // comma-separated
 
+	// Target / TurnstileWorkers are RUNTIME-ONLY (CLI or interactive start).
+	// Not loaded from or saved to config.env.
+	Target            int
+	PhysicalCap       int
 	TurnstileProvider string
+	TurnstileMode     string // offscreen | headless | auto
 	LiteSolverURL     string
+	TurnstileWorkers  int // 1-8 concurrent register/mint threads; set by start
 
 	ProtocolHTTP bool
 	HTTPPoolSize int
@@ -38,9 +65,11 @@ type Config struct {
 	TempmailLOLRetries    int
 	TempmailLOLIntervalMS int
 
-	OAuthMinIntervalSec float64
-	OAuthRetrySec       float64
+	OAuthMinIntervalSec float64 // global spacing between OAuth starts (all workers)
+	OAuthRetrySec       float64 // rate-limit cooldown base
+	OAuthWorkers        int     // concurrent OAuth workers (1–4); 0 = auto
 	ProbeEnabled        bool
+	ProbeWarmupSec      float64 // sleep before first probe (default 5)
 
 	HTTPProxy  string
 	HTTPSProxy string
@@ -61,22 +90,31 @@ func Defaults() Config {
 	return Config{
 		EmailMode:             EmailTempmail,
 		EmailAPI:              "http://127.0.0.1:8080",
+		TestmailDomain:        "inbox.testmail.app",
 		ClearanceEnabled:      true,
+		ClearanceMode:         "auto",
+		ClearanceAutoStop:     true,
 		RegisterProxy:         "http://127.0.0.1:40080",
 		FlareSolverrURL:       "http://127.0.0.1:8191",
 		ClearanceProxy:        "http://privoxy:8118",
 		ClearanceURLs:         "https://accounts.x.ai,https://x.ai,https://status.x.ai,https://console.x.ai,https://auth.x.ai",
-		Target:                10,
+		CFImpersonate:         "chrome_131",
+		CFImpersonateFallback: "chrome_124,chrome_120",
+		Target:                0, // set by start CLI/prompt
 		PhysicalCap:           0,
 		TurnstileProvider:     "browser",
+		TurnstileMode:         "offscreen",
 		LiteSolverURL:         "http://127.0.0.1:5072",
+		TurnstileWorkers:      0, // set by start CLI/prompt
 		ProtocolHTTP:          true,
 		HTTPPoolSize:          8,
 		TempmailLOLRetries:    30,
 		TempmailLOLIntervalMS: 1500,
-		OAuthMinIntervalSec:   10,
+		OAuthMinIntervalSec:   6, // stable: lower 4 easily hits device 429
 		OAuthRetrySec:         60,
+		OAuthWorkers:          0, // auto: 1 when thread≥3 or large target
 		ProbeEnabled:          true,
+		ProbeWarmupSec:        5, // stable: new tokens often 403 under 1.5–3s
 		HTTPProxy:             "http://127.0.0.1:40080",
 		HTTPSProxy:            "http://127.0.0.1:40080",
 		NoProxy:               "127.0.0.1,localhost",
@@ -104,6 +142,60 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
+// setEnvKey replaces an active KEY=... line in a .env body (first match).
+// If only a commented "# KEY=" exists, uncomment and set it. Otherwise append.
+func setEnvKey(content, key, value string) string {
+	prefix := key + "="
+	commented := "# " + prefix
+	lines := strings.Split(content, "\n")
+	found := false
+	for i, line := range lines {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, prefix) {
+			lines[i] = prefix + value
+			found = true
+			break
+		}
+	}
+	if !found {
+		for i, line := range lines {
+			trim := strings.TrimSpace(line)
+			if strings.HasPrefix(trim, commented) || trim == "#"+prefix || strings.HasPrefix(trim, "#"+prefix) {
+				lines[i] = prefix + value
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		if !strings.HasSuffix(content, "\n") && content != "" {
+			lines = append(lines, "")
+		}
+		lines = append(lines, prefix+value)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// SeedFromExample writes the sectioned Chinese template (embedded example.env)
+// to path, then applies overrides (e.g. EMAIL_MODE=tempmail).
+func SeedFromExample(path string, overrides map[string]string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	content := embeddedExample
+	// Prefer 127.0.0.1 in generated config for host-side CPA default
+	content = setEnvKey(content, "CPA_MANAGEMENT_BASE", "http://127.0.0.1:8317/v0/management")
+	for k, v := range overrides {
+		if k == "" {
+			continue
+		}
+		content = setEnvKey(content, k, v)
+	}
+	return os.WriteFile(path, []byte(content), 0o600)
+}
+
+// Save writes a compact key=value config (no section comments).
+// Prefer SeedFromExample for first-time user-facing files.
 func Save(path string, cfg Config) error {
 	var b strings.Builder
 	b.WriteString("# grok-reg config\n")
@@ -114,15 +206,36 @@ func Save(path string, cfg Config) error {
 	if cfg.EmailAPI != "" {
 		b.WriteString(fmt.Sprintf("EMAIL_API=%s\n", cfg.EmailAPI))
 	}
+	// testmail secrets: never auto-written (set manually)
+	if cfg.TestmailDomain != "" {
+		b.WriteString(fmt.Sprintf("TESTMAIL_DOMAIN=%s\n", cfg.TestmailDomain))
+	}
 	b.WriteString(fmt.Sprintf("CLEARANCE_ENABLED=%s\n", bool01(cfg.ClearanceEnabled)))
+	if cfg.ClearanceMode != "" {
+		b.WriteString(fmt.Sprintf("CLEARANCE_MODE=%s\n", cfg.ClearanceMode))
+	}
+	b.WriteString(fmt.Sprintf("CLEARANCE_AUTO_STOP=%s\n", bool01(cfg.ClearanceAutoStop)))
+	if cfg.ClearanceComposeDir != "" {
+		b.WriteString(fmt.Sprintf("CLEARANCE_COMPOSE_DIR=%s\n", cfg.ClearanceComposeDir))
+	}
+	if cfg.CFImpersonate != "" {
+		b.WriteString(fmt.Sprintf("CF_IMPERSONATE=%s\n", cfg.CFImpersonate))
+	}
+	if cfg.CFImpersonateFallback != "" {
+		b.WriteString(fmt.Sprintf("CF_IMPERSONATE_FALLBACK=%s\n", cfg.CFImpersonateFallback))
+	}
 	b.WriteString(fmt.Sprintf("REGISTER_PROXY=%s\n", cfg.RegisterProxy))
 	b.WriteString(fmt.Sprintf("FLARESOLVERR_URL=%s\n", cfg.FlareSolverrURL))
 	b.WriteString(fmt.Sprintf("CLEARANCE_PROXY=%s\n", cfg.ClearanceProxy))
 	b.WriteString(fmt.Sprintf("CLEARANCE_URLS=%s\n", cfg.ClearanceURLs))
 	b.WriteString(fmt.Sprintf("TURNSTILE_PROVIDER=%s\n", cfg.TurnstileProvider))
+	if cfg.TurnstileMode != "" {
+		b.WriteString(fmt.Sprintf("TURNSTILE_MODE=%s\n", cfg.TurnstileMode))
+	}
 	if cfg.LiteSolverURL != "" {
 		b.WriteString(fmt.Sprintf("LITE_SOLVER_URL=%s\n", cfg.LiteSolverURL))
 	}
+	// TURNSTILE_WORKERS / TARGET: not persisted — use `grok start -t N --thread M`
 	b.WriteString(fmt.Sprintf("PROTOCOL_HTTP=%s\n", bool01(cfg.ProtocolHTTP)))
 	b.WriteString(fmt.Sprintf("HTTP_POOL_SIZE=%d\n", cfg.HTTPPoolSize))
 	b.WriteString(fmt.Sprintf("TEMPMAIL_LOL_RETRIES=%d\n", cfg.TempmailLOLRetries))
@@ -131,6 +244,10 @@ func Save(path string, cfg Config) error {
 	b.WriteString(fmt.Sprintf("HTTP_PROXY=%s\n", cfg.HTTPProxy))
 	b.WriteString(fmt.Sprintf("NO_PROXY=%s\n", cfg.NoProxy))
 	b.WriteString(fmt.Sprintf("PROBE_ENABLED=%s\n", bool01(cfg.ProbeEnabled)))
+	b.WriteString(fmt.Sprintf("PROBE_WARMUP_SEC=%g\n", cfg.ProbeWarmupSec))
+	b.WriteString(fmt.Sprintf("OAUTH_MIN_INTERVAL_SEC=%g\n", cfg.OAuthMinIntervalSec))
+	b.WriteString(fmt.Sprintf("OAUTH_RETRY_SEC=%g\n", cfg.OAuthRetrySec))
+	b.WriteString(fmt.Sprintf("OAUTH_WORKERS=%d\n", cfg.OAuthWorkers))
 	b.WriteString(fmt.Sprintf("PHYSICAL_CAP=%d\n", cfg.PhysicalCap))
 	b.WriteString(fmt.Sprintf("CPA_UPLOAD_ENABLED=%s\n", bool01(cfg.CPAUploadEnabled)))
 	b.WriteString(fmt.Sprintf("CPA_MANAGEMENT_BASE=%s\n", cfg.CPAManagementBase))
@@ -138,6 +255,10 @@ func Save(path string, cfg Config) error {
 	b.WriteString(fmt.Sprintf("CPA_UPLOAD_TIMEOUT_SEC=%d\n", cfg.CPAUploadTimeoutSec))
 	b.WriteString(fmt.Sprintf("CPA_UPLOAD_RETRIES=%d\n", cfg.CPAUploadRetries))
 	b.WriteString(fmt.Sprintf("CPA_UPLOAD_NAME_TEMPLATE=%s\n", cfg.CPAUploadNameTemplate))
+	b.WriteString(fmt.Sprintf("CPA_UPLOAD_VERIFY=%s\n", bool01(cfg.CPAUploadVerify)))
+	if cfg.CPAUploadMode != "" {
+		b.WriteString(fmt.Sprintf("CPA_UPLOAD_MODE=%s\n", cfg.CPAUploadMode))
+	}
 	return os.WriteFile(path, []byte(b.String()), 0o600)
 }
 
@@ -145,13 +266,37 @@ func InteractiveSetup(path string) (Config, error) {
 	cfg := Defaults()
 	fmt.Println()
 	fmt.Println("选择邮箱模式:")
-	fmt.Println("  [1] 免费临时邮箱           (默认 · 零配置 · 直接回车)")
-	fmt.Println("  [2] 自建域名邮箱           (需 Cloudflare Email Routing + 本地 webhook)")
-	fmt.Print("输入 1 或 2 [1]: ")
+	fmt.Println("  [1] 免费临时邮箱           (tempmail.lol · 默认 · 直接回车)")
+	fmt.Println("  [2] testmail.app           (GitHub Student Pack Essential 等)")
+	fmt.Println("  [3] 自建域名邮箱           (Cloudflare Email Routing + webhook)")
+	fmt.Print("输入 1 / 2 / 3 [1]: ")
 	reader := bufio.NewReader(os.Stdin)
 	line, _ := reader.ReadString('\n')
 	line = strings.TrimSpace(line)
-	if line == "2" {
+	overrides := map[string]string{
+		"EMAIL_MODE": string(EmailTempmail),
+	}
+	switch line {
+	case "2":
+		cfg.EmailMode = EmailTestmail
+		fmt.Print("  TESTMAIL_API_KEY: ")
+		key, _ := reader.ReadString('\n')
+		cfg.TestmailAPIKey = strings.TrimSpace(key)
+		fmt.Print("  TESTMAIL_NAMESPACE: ")
+		ns, _ := reader.ReadString('\n')
+		cfg.TestmailNamespace = strings.TrimSpace(ns)
+		fmt.Print("  TESTMAIL_DOMAIN [inbox.testmail.app]: ")
+		dom, _ := reader.ReadString('\n')
+		dom = strings.TrimSpace(dom)
+		if dom == "" {
+			dom = "inbox.testmail.app"
+		}
+		cfg.TestmailDomain = dom
+		overrides["EMAIL_MODE"] = string(EmailTestmail)
+		overrides["TESTMAIL_API_KEY"] = cfg.TestmailAPIKey
+		overrides["TESTMAIL_NAMESPACE"] = cfg.TestmailNamespace
+		overrides["TESTMAIL_DOMAIN"] = cfg.TestmailDomain
+	case "3":
 		cfg.EmailMode = EmailCustom
 		fmt.Print("  你的域名 (如 example.com): ")
 		dom, _ := reader.ReadString('\n')
@@ -163,13 +308,19 @@ func InteractiveSetup(path string) (Config, error) {
 			api = "http://127.0.0.1:8080"
 		}
 		cfg.EmailAPI = api
-	} else {
+		overrides["EMAIL_MODE"] = string(EmailCustom)
+		overrides["EMAIL_DOMAIN"] = cfg.EmailDomain
+		overrides["EMAIL_API"] = cfg.EmailAPI
+	default:
 		cfg.EmailMode = EmailTempmail
+		overrides["EMAIL_MODE"] = string(EmailTempmail)
 	}
-	if err := Save(path, cfg); err != nil {
+	// Full sectioned Chinese template (includes CPA_MANAGEMENT_KEY= placeholder)
+	if err := SeedFromExample(path, overrides); err != nil {
 		return cfg, err
 	}
-	fmt.Printf("[*] 已写入 %s\n", path)
+	fmt.Printf("[*] 已写入分区注释配置 %s\n", path)
+	fmt.Printf("[*] 参考模板也会同步到同目录 config.env.example\n")
 	return cfg, nil
 }
 
@@ -181,6 +332,35 @@ func ClampTarget(n int) (int, error) {
 		return 0, fmt.Errorf("target max is 10000, got %d", n)
 	}
 	return n, nil
+}
+
+// ClampThreads limits concurrent register/mint threads to 1–8.
+func ClampThreads(n int) (int, error) {
+	if n < 1 {
+		return 0, fmt.Errorf("thread must be >= 1, got %d", n)
+	}
+	if n > 8 {
+		return 0, fmt.Errorf("thread max is 8, got %d", n)
+	}
+	return n, nil
+}
+
+// SyncExample writes/updates ~/.grok/config.env.example from the embedded template
+// so users see newly added keys after upgrades.
+func SyncExample(homeDir string) error {
+	if homeDir == "" {
+		return fmt.Errorf("empty home dir")
+	}
+	if err := os.MkdirAll(homeDir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(homeDir, "config.env.example")
+	return os.WriteFile(path, []byte(embeddedExample), 0o644)
+}
+
+// ExamplePath returns path to user-local example file.
+func ExamplePath(homeDir string) string {
+	return filepath.Join(homeDir, "config.env.example")
 }
 
 func parseEnvFile(content string) map[string]string {
@@ -212,8 +392,32 @@ func applyMap(cfg *Config, env map[string]string) {
 	if v, ok := env["EMAIL_API"]; ok {
 		cfg.EmailAPI = v
 	}
+	if v, ok := env["TESTMAIL_API_KEY"]; ok {
+		cfg.TestmailAPIKey = v
+	}
+	if v, ok := env["TESTMAIL_NAMESPACE"]; ok {
+		cfg.TestmailNamespace = v
+	}
+	if v, ok := env["TESTMAIL_DOMAIN"]; ok {
+		cfg.TestmailDomain = v
+	}
 	if v, ok := env["CLEARANCE_ENABLED"]; ok {
 		cfg.ClearanceEnabled = truthy(v)
+	}
+	if v, ok := env["CLEARANCE_MODE"]; ok {
+		cfg.ClearanceMode = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v, ok := env["CLEARANCE_AUTO_STOP"]; ok {
+		cfg.ClearanceAutoStop = truthy(v)
+	}
+	if v, ok := env["CLEARANCE_COMPOSE_DIR"]; ok {
+		cfg.ClearanceComposeDir = strings.TrimSpace(v)
+	}
+	if v, ok := env["CF_IMPERSONATE"]; ok {
+		cfg.CFImpersonate = strings.TrimSpace(v)
+	}
+	if v, ok := env["CF_IMPERSONATE_FALLBACK"]; ok {
+		cfg.CFImpersonateFallback = strings.TrimSpace(v)
 	}
 	if v, ok := env["REGISTER_PROXY"]; ok {
 		cfg.RegisterProxy = v
@@ -230,9 +434,13 @@ func applyMap(cfg *Config, env map[string]string) {
 	if v, ok := env["TURNSTILE_PROVIDER"]; ok {
 		cfg.TurnstileProvider = v
 	}
+	if v, ok := env["TURNSTILE_MODE"]; ok {
+		cfg.TurnstileMode = strings.ToLower(strings.TrimSpace(v))
+	}
 	if v, ok := env["LITE_SOLVER_URL"]; ok {
 		cfg.LiteSolverURL = v
 	}
+	// TURNSTILE_WORKERS / TARGET intentionally ignored from env (CLI-only).
 	if v, ok := env["PROTOCOL_HTTP"]; ok {
 		cfg.ProtocolHTTP = truthy(v)
 	}
@@ -262,6 +470,26 @@ func applyMap(cfg *Config, env map[string]string) {
 	}
 	if v, ok := env["PROBE_ENABLED"]; ok {
 		cfg.ProbeEnabled = truthy(v)
+	}
+	if v, ok := env["PROBE_WARMUP_SEC"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.ProbeWarmupSec = f
+		}
+	}
+	if v, ok := env["OAUTH_MIN_INTERVAL_SEC"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.OAuthMinIntervalSec = f
+		}
+	}
+	if v, ok := env["OAUTH_RETRY_SEC"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.OAuthRetrySec = f
+		}
+	}
+	if v, ok := env["OAUTH_WORKERS"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.OAuthWorkers = n
+		}
 	}
 	if v, ok := env["PHYSICAL_CAP"]; ok {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -297,8 +525,6 @@ func applyMap(cfg *Config, env map[string]string) {
 		cfg.CPAUploadMode = v
 	}
 }
-
-
 
 func truthy(v string) bool {
 	v = strings.ToLower(strings.TrimSpace(v))

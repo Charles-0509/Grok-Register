@@ -10,7 +10,8 @@ type Envelope[T any] struct {
 	Value     T
 	CreatedAt time.Time
 	ExpiresAt time.Time
-	release   func()
+	release   func() // always: free inventory slot
+	onExpire  func() // optional: only when TTL purge discards item
 	once      sync.Once
 }
 
@@ -19,6 +20,21 @@ func (e *Envelope[T]) Release() {
 		return
 	}
 	e.once.Do(func() {
+		if e.release != nil {
+			e.release()
+		}
+	})
+}
+
+// expire drops a TTL'd item: slot + onExpire (e.g. pipeline seat).
+func (e *Envelope[T]) expire() {
+	if e == nil {
+		return
+	}
+	e.once.Do(func() {
+		if e.onExpire != nil {
+			e.onExpire()
+		}
 		if e.release != nil {
 			e.release()
 		}
@@ -72,6 +88,11 @@ func (inv *Inventory[T, Q]) signal() {
 }
 
 func (inv *Inventory[T, Q]) PutT(ctx context.Context, v T, maxAge time.Duration) error {
+	return inv.PutTWithExpire(ctx, v, maxAge, nil)
+}
+
+// PutTWithExpire is PutT plus optional onExpire (TTL discard only).
+func (inv *Inventory[T, Q]) PutTWithExpire(ctx context.Context, v T, maxAge time.Duration, onExpire func()) error {
 	if err := inv.tSlots.Acquire(ctx); err != nil {
 		return err
 	}
@@ -79,6 +100,7 @@ func (inv *Inventory[T, Q]) PutT(ctx context.Context, v T, maxAge time.Duration)
 		Value:     v,
 		CreatedAt: time.Now(),
 		release:   func() { inv.tSlots.Release() },
+		onExpire:  onExpire,
 	}
 	if maxAge > 0 {
 		env.ExpiresAt = time.Now().Add(maxAge)
@@ -92,6 +114,11 @@ func (inv *Inventory[T, Q]) PutT(ctx context.Context, v T, maxAge time.Duration)
 }
 
 func (inv *Inventory[T, Q]) PutQ(ctx context.Context, v Q, maxAge time.Duration) error {
+	return inv.PutQWithExpire(ctx, v, maxAge, nil)
+}
+
+// PutQWithExpire is PutQ plus optional onExpire (TTL discard only; use to free pipeline seats).
+func (inv *Inventory[T, Q]) PutQWithExpire(ctx context.Context, v Q, maxAge time.Duration, onExpire func()) error {
 	if err := inv.qSlots.Acquire(ctx); err != nil {
 		return err
 	}
@@ -99,6 +126,7 @@ func (inv *Inventory[T, Q]) PutQ(ctx context.Context, v Q, maxAge time.Duration)
 		Value:     v,
 		CreatedAt: time.Now(),
 		release:   func() { inv.qSlots.Release() },
+		onExpire:  onExpire,
 	}
 	if maxAge > 0 {
 		env.ExpiresAt = time.Now().Add(maxAge)
@@ -145,7 +173,7 @@ func (inv *Inventory[T, Q]) purgeLocked() {
 	var ts []*Envelope[T]
 	for _, e := range inv.ts {
 		if !e.ExpiresAt.IsZero() && now.After(e.ExpiresAt) {
-			e.Release()
+			e.expire() // slot + onExpire
 			continue
 		}
 		ts = append(ts, e)
@@ -154,7 +182,7 @@ func (inv *Inventory[T, Q]) purgeLocked() {
 	var qs []*Envelope[Q]
 	for _, e := range inv.qs {
 		if !e.ExpiresAt.IsZero() && now.After(e.ExpiresAt) {
-			e.Release()
+			e.expire()
 			continue
 		}
 		qs = append(qs, e)
