@@ -149,24 +149,30 @@ func (e *Engine) run(ctx context.Context) error {
 
 	sWorkers, pWorkers, cWorkers, oauthWorkers, physCap := deriveWorkers(cfg)
 	e.phys = inventory.NewSemaphore(physCap)
-	// Pending email codes in flight: cap by target so target=5 doesn't open 12 boxes.
-	qPend := cfg.Target
-	if qPend <= 0 {
-		qPend = 4
-	}
-	if qPend > 6 {
-		qPend = 6
-	}
+	// Pending email codes in flight: follow --thread (was hard cap 6 → reserved flood).
+	qPend := sWorkers + 1
 	if qPend < 2 {
 		qPend = 2
 	}
+	if qPend > 4 {
+		qPend = 4
+	}
+	if cfg.Target > 0 && cfg.Target < qPend {
+		qPend = cfg.Target
+	}
 	e.qPending = inventory.NewSemaphore(qPend)
-	tSlots, qSlots := 4, 4
-	if cfg.Target > 0 && cfg.Target < 4 {
+	tSlots, qSlots := sWorkers+1, sWorkers+1
+	if tSlots < 2 {
+		tSlots, qSlots = 2, 2
+	}
+	if tSlots > 5 {
+		tSlots, qSlots = 5, 5
+	}
+	if cfg.Target > 0 && cfg.Target < tSlots {
 		tSlots, qSlots = cfg.Target, cfg.Target
 	}
 	e.inv = inventory.New[string, QItem](tSlots, qSlots)
-	log.Infof("workers S=%d P=%d C=%d OAuth=%d phys=%d q_pending=%d", sWorkers, pWorkers, cWorkers, oauthWorkers, physCap, qPend)
+	log.Infof("workers S=%d P=%d C=%d OAuth=%d phys=%d q_pending=%d t/q_slots=%d", sWorkers, pWorkers, cWorkers, oauthWorkers, physCap, qPend, tSlots)
 
 	_ = st.Set(func(s *state.Snapshot) {
 		s.Status = state.StatusRunning
@@ -582,10 +588,17 @@ func (e *Engine) pWorker(ctx context.Context, id int) {
 			}
 			continue
 		}
+		// Don't flood Q ahead of Turnstile: cap pending Q near S workers.
 		_, qDepth := e.inv.Depths()
-		qCap := e.remainingCapacity()
-		if qCap > 4 {
-			qCap = 4
+		qCap := e.opt.Cfg.TurnstileWorkers
+		if qCap < 1 {
+			qCap = 2
+		}
+		if qCap > 3 {
+			qCap = 3
+		}
+		if rem := e.remainingCapacity(); rem < qCap {
+			qCap = rem
 		}
 		if qCap < 1 {
 			qCap = 1
@@ -644,13 +657,18 @@ func (e *Engine) pWorker(ctx context.Context, id int) {
 			continue
 		}
 		item := QItem{Email: h.Email, Password: h.Password, Code: code, Handle: h}
-		if err := e.inv.PutQ(ctx, item, 2*time.Minute); err != nil {
+		// Q TTL must outlive slow Turnstile; onExpire frees reserved seat (was leaking → stuck).
+		email := h.Email
+		if err := e.inv.PutQWithExpire(ctx, item, 8*time.Minute, func() {
+			e.releaseReserve()
+			log.Warnf("[P%d] Q 过期丢弃 %s（座位已释放 reserved=%d）", id, email, e.reserved.Load())
+		}); err != nil {
 			e.qPending.Release()
 			e.releaseReserve()
 			return
 		}
 		e.qPending.Release()
-		// seat stays reserved until signup fail / oauth fail / CPA success
+		// seat stays reserved until signup fail / oauth fail / CPA success / Q TTL expire
 		log.Debugf("[P%d] Q ready %s (reserved=%d done=%d/%d)", id, h.Email, e.reserved.Load(), e.done.Load(), e.opt.Target)
 	}
 }
@@ -890,27 +908,32 @@ func deriveWorkers(cfg config.Config) (s, p, c, oa, phys int) {
 			s = cfg.TurnstileWorkers
 		}
 	}
-	// P workers: don't spawn 8 when target is 5 (was flooding tempmail).
+	// P workers: track --thread (S). Fixed P=4 with S=3 flooded reserved queue.
 	target := cfg.Target
 	if target <= 0 {
 		target = 10
 	}
-	p = target
+	if s < 1 {
+		s = 1
+	}
+	p = s
 	if p > 4 {
 		p = 4
+	}
+	if p > target {
+		p = target
 	}
 	if p < 1 {
 		p = 1
 	}
 	c = 2
-	if target < 2 {
+	if target < 2 || s < 2 {
 		c = 1
 	}
-	// OAuth: default 1 worker when high register concurrency (avoid rate_limited);
-	// allow 2 for small thread counts or explicit OAUTH_WORKERS.
+	// OAuth: default 1 when register concurrency ≥3 (device/auth 429); else 2.
 	oa = cfg.OAuthWorkers
 	if oa <= 0 {
-		if s >= 4 || target >= 8 {
+		if s >= 3 || target >= 8 {
 			oa = 1
 		} else {
 			oa = 2
@@ -921,9 +944,6 @@ func deriveWorkers(cfg config.Config) (s, p, c, oa, phys int) {
 	}
 	if oa < 1 {
 		oa = 1
-	}
-	if s < 1 {
-		s = 1
 	}
 	return
 }

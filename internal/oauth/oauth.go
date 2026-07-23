@@ -189,6 +189,10 @@ func (c *Client) StartDeviceFlow(ctx context.Context) (DeviceFlow, error) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode/100 != 2 {
+		if resp.StatusCode == 429 {
+			c.TripRateLimit()
+			return DeviceFlow{}, fmt.Errorf("%w: device authorization status=429", ErrRateLimited)
+		}
 		return DeviceFlow{}, fmt.Errorf("device authorization rejected status=%d", resp.StatusCode)
 	}
 	var doc map[string]any
@@ -492,21 +496,24 @@ func jwtClaim(token, key string) string {
 }
 
 // Exchange is convenience: start flow + confirm HTTP + poll.
-// On rate_limited, wait cooldown and retry once (avoids dropping a good SSO).
+// On rate_limited / device 429, wait cooldown and retry (keeps good SSO).
 func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 	var last error
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		if err := c.WaitRateLimit(ctx); err != nil {
 			return Credential{}, err
 		}
 		flow, err := c.StartDeviceFlow(ctx)
 		if err != nil {
+			last = err
+			if (errors.Is(err, ErrRateLimited) || strings.Contains(err.Error(), "status=429")) && attempt < 2 {
+				continue
+			}
 			return Credential{}, err
 		}
 		if err := c.ConfirmHTTP(ctx, sso, flow); err != nil {
 			last = err
-			if errors.Is(err, ErrRateLimited) && attempt == 0 {
-				// WaitRateLimit will block until probe window
+			if errors.Is(err, ErrRateLimited) && attempt < 2 {
 				continue
 			}
 			return Credential{}, err

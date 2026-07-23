@@ -42,3 +42,20 @@ func TestSemaphore(t *testing.T) {
 	}
 	s.Release()
 }
+
+func TestQExpireOnExpire(t *testing.T) {
+	inv := New[string, int](2, 2)
+	ctx := context.Background()
+	var n int
+	if err := inv.PutQWithExpire(ctx, 7, 30*time.Millisecond, func() { n++ }); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	tt, qq := inv.Depths()
+	if tt != 0 || qq != 0 {
+		t.Fatalf("expected empty after expire, t=%d q=%d", tt, qq)
+	}
+	if n != 1 {
+		t.Fatalf("onExpire called %d want 1", n)
+	}
+}
