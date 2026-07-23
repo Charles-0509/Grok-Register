@@ -26,7 +26,10 @@ grok upload                # 手动上传 CPA JSON 到 Management API
 | **testmail** | `EMAIL_MODE=testmail`，GitHub Student Pack 等 |
 | **全局座位上限** | `done + reserved ≤ target` |
 | **CPA 上传 wait** | 结束前等待 Management 上传，避免进程先退出 |
-| **一键安装** | 路径/命令名/WARP/结束停容器交互 |
+| **一键安装** | 路径/命令名/WARP/结束停容器交互；安全同步（不再误删非空目录） |
+| **`grok stop` 停清障** | `CLEARANCE_AUTO_STOP=1` 时手动 stop 也会 `docker compose stop` |
+| **grok2api 导出** | `outputs/<run>/grok2api/tokens.txt` 仅 SSO token（一行一个） |
+| **OAuth 限速** | 全局间隔 + discovery 缓存 + rate_limited 重试 |
 
 ### 架构三腿
 
@@ -415,20 +418,25 @@ grok upload
 ├── run.pid / run.lock / state.json
 ├── logs/run-yyyymmdd-HHMMSS.log
 └── outputs/<run_id>/
-    ├── SSO/
-    ├── CPA/          # 探活成功，可导入
+    ├── SSO/                 # email:password:sso
+    ├── CPA/                 # 探活成功 JSON（cliproxy/CPA）
+    ├── grok2api/tokens.txt  # 仅 SSO token，一行一个
     └── discarded/
 ```
 
 ### 8. 更新
 
 ```bash
-cd /opt/Grok-Register
+# 推荐：重跑一键（保留 config.env，自动补齐新键）
+curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scripts/install.sh | sudo bash
+
+# 或手动
+cd /opt/Grok-Register   # mac: ~/Grok-Register
 sudo git pull
 export PATH=$PATH:/usr/local/go/bin
-make build && sudo make install
-# 或重跑一键（会 reset 到 origin/branch，保留已有 config.env）：
-# curl -fsSL .../install.sh | sudo bash
+make build && sudo make install   # mac: make install PREFIX=$HOME/.local
+# Linux 无头服务器 Turnstile:
+sudo apt-get install -y xvfb
 ```
 
 ### macOS 备注
@@ -446,7 +454,7 @@ make build && sudo make install
 | `grok start -t N --thread M` | 目标 N（1–10000）；线程 M（1–8）；**计数 = CPA 探活成功数** |
 | `grok status` | 进度、线程、当前步骤 |
 | `grok logs` / `logs -f` | 最近日志 / 跟踪 |
-| `grok stop` | 立即停止 |
+| `grok stop` | 停止注册机；`CLEARANCE_AUTO_STOP=1` 时同步停清障容器 |
 | `grok config` | 打开 `config.env`，刷新 `config.env.example` |
 | `grok upload` | 选最近 run，上传 CPA JSON |
 
@@ -594,6 +602,81 @@ CPA_MANAGEMENT_BASE=http://127.0.0.1:8317/v0/management
 **邮箱建得特别多**
 
 请更新到含全局 `reserved` 座位上限的版本。
+
+---
+
+## 更新日志（近期）
+
+### 2026-07 · OAuth / 运维 / 导出
+
+- **OAuth**：全局启动间隔（默认 4s）、OIDC discovery 缓存、`rate_limited` 自动重试一次；高并发默认 1 个 OAuth worker
+- **探活**：`PROBE_WARMUP_SEC` 默认 1.5s；403 重试间隔缩短
+- **`grok stop`**：在 `CLEARANCE_AUTO_STOP=1` 时同步 `docker compose stop` 清障栈（以前只有达目标/正常结束才停）
+- **安装安全**：非默认 `INSTALL_DIR` 且无 `.git` 时不再 `rm -rf` 整目录；危险/非空非本仓目录直接拒绝
+- **grok2api**：`outputs/<run>/grok2api/tokens.txt` 仅 SSO token，一行一个
+- **一键安装**：Linux 默认装 `xvfb`；种子/升级合并 `TURNSTILE_MODE=offscreen`、`CF_IMPERSONATE`、`OAUTH_*`、`PROBE_WARMUP_SEC` 等
+
+### 更早（协议优先批次）
+
+- TLS `chrome_131` + `CLEARANCE_MODE=auto|always|never`
+- Turnstile `offscreen`（有 `$DISPLAY`/`xvfb-run` 时有头屏外；无显示则 headless 回退）
+- CPA Management 上传结束前等待；座位 `done+reserved≤target`
+- 分区中文 `config.env` 模板；交互 WARP/代理/自动停容器
+
+### 旧版本升级（命令集合）
+
+**Linux（Debian/Ubuntu）**
+
+```bash
+# 1) 系统包（无头 Turnstile 需要 xvfb）
+sudo apt-get update -y
+sudo apt-get install -y xvfb
+
+# 2) 更新源码 + 重装 CLI（推荐重跑一键，会保留 config 并补齐新键）
+curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scripts/install.sh | sudo bash
+
+# 或手动:
+#   cd /opt/Grok-Register && sudo git pull
+#   export PATH=$PATH:/usr/local/go/bin
+#   make build && sudo make install
+
+# 3) 若未跑一键 merge，手工补 config（路径按你的 GROK_HOME）
+CFG="${GROK_HOME:-$HOME/.grok}/config.env"
+# root 安装时常是 /home/<用户>/.grok
+grep -q '^CLEARANCE_MODE=' "$CFG" 2>/dev/null || echo 'CLEARANCE_MODE=auto' >>"$CFG"
+grep -q '^CLEARANCE_AUTO_STOP=' "$CFG" 2>/dev/null || echo 'CLEARANCE_AUTO_STOP=1' >>"$CFG"
+grep -q '^CF_IMPERSONATE=' "$CFG" 2>/dev/null || echo 'CF_IMPERSONATE=chrome_131' >>"$CFG"
+grep -q '^CF_IMPERSONATE_FALLBACK=' "$CFG" 2>/dev/null || echo 'CF_IMPERSONATE_FALLBACK=chrome_124,chrome_120' >>"$CFG"
+grep -q '^TURNSTILE_MODE=' "$CFG" 2>/dev/null || echo 'TURNSTILE_MODE=offscreen' >>"$CFG"
+grep -q '^OAUTH_MIN_INTERVAL_SEC=' "$CFG" 2>/dev/null || echo 'OAUTH_MIN_INTERVAL_SEC=4' >>"$CFG"
+grep -q '^OAUTH_RETRY_SEC=' "$CFG" 2>/dev/null || echo 'OAUTH_RETRY_SEC=45' >>"$CFG"
+grep -q '^PROBE_WARMUP_SEC=' "$CFG" 2>/dev/null || echo 'PROBE_WARMUP_SEC=1.5' >>"$CFG"
+
+# 4) 验证
+which grok; grok help
+command -v xvfb-run && xvfb-run -a echo xvfb_ok
+```
+
+**macOS**
+
+```bash
+# 1) 依赖（一般无需 xvfb；Docker Desktop 保持运行）
+brew install go python 2>/dev/null || true
+
+# 2) 一键或手动
+curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scripts/install.sh | bash
+# 或: cd ~/Grok-Register && git pull && make build && make install PREFIX=$HOME/.local
+
+# 3) 补 config（同 Linux，CFG=~/.grok/config.env）
+CFG="${GROK_HOME:-$HOME/.grok}/config.env"
+grep -q '^OAUTH_MIN_INTERVAL_SEC=' "$CFG" 2>/dev/null || echo 'OAUTH_MIN_INTERVAL_SEC=4' >>"$CFG"
+grep -q '^OAUTH_RETRY_SEC=' "$CFG" 2>/dev/null || echo 'OAUTH_RETRY_SEC=45' >>"$CFG"
+grep -q '^PROBE_WARMUP_SEC=' "$CFG" 2>/dev/null || echo 'PROBE_WARMUP_SEC=1.5' >>"$CFG"
+grep -q '^TURNSTILE_MODE=' "$CFG" 2>/dev/null || echo 'TURNSTILE_MODE=offscreen' >>"$CFG"
+grep -q '^CLEARANCE_AUTO_STOP=' "$CFG" 2>/dev/null || echo 'CLEARANCE_AUTO_STOP=1' >>"$CFG"
+```
+
+可选调参：OAuth 仍限流可把 `OAUTH_MIN_INTERVAL_SEC` 调到 `6`–`8`，或 `OAUTH_WORKERS=1`。
 
 ---
 

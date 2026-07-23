@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,9 @@ import (
 
 	"github.com/grok-free-register/grok-reg/internal/clearance"
 )
+
+// ErrRateLimited is returned when auth.x.ai redirects with error=rate_limited.
+var ErrRateLimited = errors.New("rate_limited")
 
 const (
 	DiscoveryURL = "https://auth.x.ai/.well-known/openid-configuration"
@@ -35,16 +39,16 @@ type DeviceFlow struct {
 }
 
 type Credential struct {
-	AccessToken  string
-	RefreshToken string
-	IDToken      string
-	TokenType    string
-	ExpiresIn    int
-	ExpiresAt    string
-	LastRefresh  string
-	Subject      string
+	AccessToken   string
+	RefreshToken  string
+	IDToken       string
+	TokenType     string
+	ExpiresIn     int
+	ExpiresAt     string
+	LastRefresh   string
+	Subject       string
 	TokenEndpoint string
-	Email        string
+	Email         string
 }
 
 type Client struct {
@@ -53,14 +57,20 @@ type Client struct {
 	clear *clearance.Manager
 
 	// rate limit gate
-	mu          sync.Mutex
-	trippedAt   time.Time
-	nextProbe   time.Time
-	cooldown    time.Duration
-	baseCool    time.Duration
-	trips       int
-	probeToken  int
-	probeSeq    int
+	mu         sync.Mutex
+	trippedAt  time.Time
+	nextProbe  time.Time
+	cooldown   time.Duration
+	baseCool   time.Duration
+	trips      int
+	probeToken int
+	probeSeq   int
+
+	// OIDC discovery cache (device + token endpoints)
+	discMu   sync.Mutex
+	deviceEP string
+	tokenEP  string
+	discAt   time.Time
 }
 
 func NewClient(proxy string, cm *clearance.Manager, baseCooldown time.Duration) (*Client, error) {
@@ -215,6 +225,14 @@ func (c *Client) StartDeviceFlow(ctx context.Context) (DeviceFlow, error) {
 }
 
 func (c *Client) discover(ctx context.Context) (deviceEP, tokenEP string, err error) {
+	c.discMu.Lock()
+	if c.deviceEP != "" && c.tokenEP != "" && time.Since(c.discAt) < 30*time.Minute {
+		d, t := c.deviceEP, c.tokenEP
+		c.discMu.Unlock()
+		return d, t, nil
+	}
+	c.discMu.Unlock()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, DiscoveryURL, nil)
 	if err != nil {
 		return "", "", err
@@ -238,6 +256,9 @@ func (c *Client) discover(ctx context.Context) (deviceEP, tokenEP string, err er
 	if deviceEP == "" || tokenEP == "" {
 		return "", "", fmt.Errorf("discovery missing endpoints")
 	}
+	c.discMu.Lock()
+	c.deviceEP, c.tokenEP, c.discAt = deviceEP, tokenEP, time.Now()
+	c.discMu.Unlock()
 	return deviceEP, tokenEP, nil
 }
 
@@ -259,7 +280,7 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 	if err := locationError(loc); err != nil {
-		if err.Error() == "rate_limited" {
+		if errors.Is(err, ErrRateLimited) {
 			c.TripRateLimit()
 		}
 		return err
@@ -296,7 +317,7 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 	body, _ := io.ReadAll(io.LimitReader(resp2.Body, 1<<20))
 	_ = resp2.Body.Close()
 	if err := locationError(aloc); err != nil {
-		if err.Error() == "rate_limited" {
+		if errors.Is(err, ErrRateLimited) {
 			c.TripRateLimit()
 		}
 		return err
@@ -327,6 +348,9 @@ func locationError(loc string) error {
 	e := u.Query().Get("error")
 	if e == "" {
 		return nil
+	}
+	if e == "rate_limited" {
+		return ErrRateLimited
 	}
 	return fmt.Errorf("%s", e)
 }
@@ -468,16 +492,29 @@ func jwtClaim(token, key string) string {
 }
 
 // Exchange is convenience: start flow + confirm HTTP + poll.
+// On rate_limited, wait cooldown and retry once (avoids dropping a good SSO).
 func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
-	if err := c.WaitRateLimit(ctx); err != nil {
-		return Credential{}, err
+	var last error
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := c.WaitRateLimit(ctx); err != nil {
+			return Credential{}, err
+		}
+		flow, err := c.StartDeviceFlow(ctx)
+		if err != nil {
+			return Credential{}, err
+		}
+		if err := c.ConfirmHTTP(ctx, sso, flow); err != nil {
+			last = err
+			if errors.Is(err, ErrRateLimited) && attempt == 0 {
+				// WaitRateLimit will block until probe window
+				continue
+			}
+			return Credential{}, err
+		}
+		return c.PollToken(ctx, flow)
 	}
-	flow, err := c.StartDeviceFlow(ctx)
-	if err != nil {
-		return Credential{}, err
+	if last == nil {
+		last = fmt.Errorf("oauth_failed")
 	}
-	if err := c.ConfirmHTTP(ctx, sso, flow); err != nil {
-		return Credential{}, err
-	}
-	return c.PollToken(ctx, flow)
+	return Credential{}, last
 }

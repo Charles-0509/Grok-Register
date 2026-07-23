@@ -139,9 +139,9 @@ func Stop(paths home.Paths) error {
 	if err != nil {
 		return err
 	}
-	// Graceful first.
+	// Graceful first — pipeline may drain OAuth / CPA upload before exit.
 	_ = proc.Signal(syscall.SIGTERM)
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
 		if !PIDAlive(pid) {
 			ClearPID(paths.PID)

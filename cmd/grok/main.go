@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/grok-free-register/grok-reg/internal/clearance"
 	"github.com/grok-free-register/grok-reg/internal/config"
 	"github.com/grok-free-register/grok-reg/internal/cpa"
 	"github.com/grok-free-register/grok-reg/internal/daemon"
@@ -104,7 +105,9 @@ func printHelp() {
   升级后请查看 ~/.grok/config.env.example 了解新增配置项
 
 数据目录: ~/.grok/ (可用 GROK_HOME 覆盖)
-输出:     ~/.grok/outputs/<yyyymmdd-HHMMSS>/{SSO,CPA}/
+  输出:     ~/.grok/outputs/<yyyymmdd-HHMMSS>/{SSO,CPA,grok2api}/
+            grok2api/tokens.txt = 单行 SSO token（无密码，供 grok2api）
+  grok stop 在 CLEARANCE_AUTO_STOP=1 时会同时 docker compose stop 清障栈
 `)
 }
 
@@ -505,7 +508,33 @@ func cmdStop() error {
 		s.PID = 0
 	})
 	fmt.Println("[✓] 注册机已停止")
+	// Worker may be SIGKILL'd before pipeline defer; always stop clearance when configured.
+	stopClearanceStackOnStop(p)
 	return nil
+}
+
+// stopClearanceStackOnStop mirrors CLEARANCE_AUTO_STOP for manual `grok stop`.
+func stopClearanceStackOnStop(p home.Paths) {
+	cfg, err := config.Load(p.Config)
+	if err != nil {
+		// Defaults: auto-stop on
+		cfg = config.Defaults()
+	}
+	if !cfg.ClearanceAutoStop || !cfg.ClearanceEnabled {
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(cfg.ClearanceMode))
+	if mode == "never" {
+		return
+	}
+	msg, err := clearance.StopStack(cfg.ClearanceComposeDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] 清障栈停止失败: %v\n", err)
+		return
+	}
+	if msg != "" {
+		fmt.Printf("[✓] %s\n", msg)
+	}
 }
 
 func cmdLogs(args []string) error {
@@ -704,4 +733,3 @@ func cmdUpload() error {
 	fmt.Printf("[✓] 完成 ok=%d fail=%d skip_runs=%d\n", okN, failN, skipN)
 	return nil
 }
-

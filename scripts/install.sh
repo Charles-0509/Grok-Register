@@ -537,6 +537,10 @@ apply_network_to_config() {
   env_set_key "$dest" "CF_IMPERSONATE" "chrome_131"
   env_set_key "$dest" "CF_IMPERSONATE_FALLBACK" "chrome_124,chrome_120"
   env_set_key "$dest" "TURNSTILE_MODE" "offscreen"
+  # OAuth 限速 + 探活（大更新默认）
+  env_set_key "$dest" "OAUTH_MIN_INTERVAL_SEC" "4"
+  env_set_key "$dest" "OAUTH_RETRY_SEC" "45"
+  env_set_key "$dest" "PROBE_WARMUP_SEC" "1.5"
   if [ -n "${INSTALL_DIR:-}" ] && [ -d "$INSTALL_DIR/clearance" ]; then
     env_set_key "$dest" "CLEARANCE_COMPOSE_DIR" "$INSTALL_DIR/clearance"
   fi
@@ -556,11 +560,16 @@ seed_config_from_example() {
 # 由 install.sh 生成 — ${COMMAND_NAME} config 可编辑
 EMAIL_MODE=tempmail
 CLEARANCE_ENABLED=1
+CLEARANCE_MODE=auto
+CLEARANCE_AUTO_STOP=1
+CF_IMPERSONATE=chrome_131
+CF_IMPERSONATE_FALLBACK=chrome_124,chrome_120
 REGISTER_PROXY=http://127.0.0.1:40080
 FLARESOLVERR_URL=http://127.0.0.1:8191
 CLEARANCE_PROXY=http://privoxy:8118
 CLEARANCE_URLS=https://accounts.x.ai,https://x.ai,https://status.x.ai,https://console.x.ai,https://auth.x.ai
 TURNSTILE_PROVIDER=browser
+TURNSTILE_MODE=offscreen
 PROTOCOL_HTTP=1
 HTTP_POOL_SIZE=8
 TEMPMAIL_LOL_RETRIES=30
@@ -568,7 +577,10 @@ TEMPMAIL_LOL_MIN_INTERVAL_MS=1500
 HTTPS_PROXY=http://127.0.0.1:40080
 HTTP_PROXY=http://127.0.0.1:40080
 NO_PROXY=127.0.0.1,localhost
+OAUTH_MIN_INTERVAL_SEC=4
+OAUTH_RETRY_SEC=45
 PROBE_ENABLED=1
+PROBE_WARMUP_SEC=1.5
 CPA_UPLOAD_ENABLED=0
 CPA_MANAGEMENT_BASE=http://127.0.0.1:8317/v0/management
 CPA_MANAGEMENT_KEY=
@@ -598,6 +610,29 @@ EOF
   chmod 600 "$dest" 2>/dev/null || true
 }
 
+# 危险路径保护：禁止把整盘/用户主目录当 INSTALL_DIR 再 rm -rf
+_install_dir_is_safe() {
+  local d="$1"
+  d="$(cd "$(dirname "$d")" 2>/dev/null && pwd)/$(basename "$d")" 2>/dev/null || d="$1"
+  case "$d" in
+    /|/root|/home|/Users|/opt|/usr|/usr/local|/var|/var/lib|/etc|/tmp|/private)
+      return 1
+      ;;
+  esac
+  # 已存在且非空、又不是本仓库时，不要整目录删除
+  if [ -d "$d" ] && [ ! -d "$d/.git" ]; then
+    # 允许空目录
+    if [ -n "$(ls -A "$d" 2>/dev/null || true)" ]; then
+      # 若看起来像 Grok-Register（有 go.mod + cmd/grok）仍可安全替换内容
+      if [ -f "$d/go.mod" ] && [ -d "$d/cmd/grok" ]; then
+        return 0
+      fi
+      return 1
+    fi
+  fi
+  return 0
+}
+
 sync_repo() {
   log "同步源码 → $INSTALL_DIR"
   mkdir -p "$(dirname "$INSTALL_DIR")"
@@ -606,8 +641,35 @@ sync_repo() {
     git -C "$INSTALL_DIR" fetch origin
     git -C "$INSTALL_DIR" checkout "$BRANCH"
     git -C "$INSTALL_DIR" reset --hard "origin/$BRANCH"
+  elif [ -d "$INSTALL_DIR" ] && [ -f "$INSTALL_DIR/go.mod" ] && [ -d "$INSTALL_DIR/cmd/grok" ]; then
+    # 无 .git 的源码树：只清空仓库内容再 clone，不删父级目录本身
+    warn "目录已有源码但无 .git，将在此目录内重新 clone（不删除父级）"
+    _tmp_clone="$(mktemp -d "${TMPDIR:-/tmp}/grok-reg-clone.XXXXXX")"
+    git clone --branch "$BRANCH" --depth 1 "$REPO_URL" "$_tmp_clone/src" || {
+      rm -rf "$_tmp_clone"
+      die "git clone 失败"
+    }
+    find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    cp -a "$_tmp_clone/src/." "$INSTALL_DIR"/
+    rm -rf "$_tmp_clone"
   else
-    rm -rf "$INSTALL_DIR"
+    if [ -e "$INSTALL_DIR" ] && [ ! -d "$INSTALL_DIR/.git" ]; then
+      if ! _install_dir_is_safe "$INSTALL_DIR"; then
+        die "拒绝删除非空/危险目录: $INSTALL_DIR
+请换空目录，或指定 --install-dir /opt/Grok-Register，或手动清空后再装。
+（旧版在无 .git 时会 rm -rf 整个 INSTALL_DIR，已修复）"
+      fi
+      # 安全空目录或仅本项目：可删
+      if [ -d "$INSTALL_DIR" ]; then
+        # 仅当目录为空或仅我们自己创建时删除重建
+        if [ -z "$(ls -A "$INSTALL_DIR" 2>/dev/null || true)" ]; then
+          rmdir "$INSTALL_DIR" 2>/dev/null || true
+        else
+          die "目录非空且不是 Grok-Register 仓库: $INSTALL_DIR
+请使用空目录，例如: --install-dir /opt/Grok-Register"
+        fi
+      fi
+    fi
     git clone --branch "$BRANCH" --depth 1 "$REPO_URL" "$INSTALL_DIR"
   fi
   if [ "$OS" = "linux" ] && [ "$INSTALL_DIR" = "/opt/Grok-Register" ]; then
@@ -691,6 +753,30 @@ chown_if_sudo_user() {
   fi
 }
 
+# 升级时把新键写入已有 config.env（不覆盖用户已有值）
+merge_upgrade_keys() {
+  local dest="$1"
+  [ -f "$dest" ] || return 0
+  env_set_key_if_missing() {
+    local f="$1" k="$2" v="$3"
+    if ! grep -qE "^${k}=" "$f" 2>/dev/null; then
+      printf '%s=%s\n' "$k" "$v" >>"$f"
+      log "config 补齐: $k=$v"
+    fi
+  }
+  env_set_key_if_missing "$dest" "CLEARANCE_MODE" "auto"
+  env_set_key_if_missing "$dest" "CLEARANCE_AUTO_STOP" "1"
+  env_set_key_if_missing "$dest" "CF_IMPERSONATE" "chrome_131"
+  env_set_key_if_missing "$dest" "CF_IMPERSONATE_FALLBACK" "chrome_124,chrome_120"
+  env_set_key_if_missing "$dest" "TURNSTILE_MODE" "offscreen"
+  env_set_key_if_missing "$dest" "OAUTH_MIN_INTERVAL_SEC" "4"
+  env_set_key_if_missing "$dest" "OAUTH_RETRY_SEC" "45"
+  env_set_key_if_missing "$dest" "PROBE_WARMUP_SEC" "1.5"
+  if [ -n "${INSTALL_DIR:-}" ] && [ -d "$INSTALL_DIR/clearance" ]; then
+    env_set_key_if_missing "$dest" "CLEARANCE_COMPOSE_DIR" "$INSTALL_DIR/clearance"
+  fi
+}
+
 prepare_data_dir() {
   log "准备数据目录 $GROK_HOME_OPT"
   mkdir -p "$GROK_HOME_OPT" "$GROK_HOME_OPT/logs" "$GROK_HOME_OPT/outputs"
@@ -707,6 +793,7 @@ prepare_data_dir() {
     seed_config_from_example "$GROK_HOME_OPT/config.env"
   else
     ok "保留已有 config.env"
+    merge_upgrade_keys "$GROK_HOME_OPT/config.env"
   fi
   chown_if_sudo_user
 }

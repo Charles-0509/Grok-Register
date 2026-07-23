@@ -69,7 +69,11 @@ type Engine struct {
 	oaN      atomic.Int64
 	fail     atomic.Int64
 
-	start   time.Time
+	// Global OAuth pacing (shared by all oauth workers) — avoids dual-worker rate_limited.
+	oauthGateMu    sync.Mutex
+	oauthLastStart time.Time
+
+	start    time.Time
 	wgReg    sync.WaitGroup // S/P/C
 	wgOAuth  sync.WaitGroup
 	wgAux    sync.WaitGroup // status ticker etc
@@ -705,6 +709,12 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 			log.Warnf("write sso: %v", err)
 		}
 		_ = cpa.AppendAuthSession(filepath.Join(e.opt.Run.SSO, "auth-sessions.jsonl"), q.Email, sso)
+		// grok2api: bare SSO token only (one per line)
+		if e.opt.Run.Grok2API != "" {
+			if err := cpa.AppendGrok2APIToken(e.opt.Run.Grok2API, sso); err != nil {
+				log.Warnf("write grok2api token: %v", err)
+			}
+		}
 		n := e.ssoN.Add(1)
 		log.OKf("注册成功 #%d %s", n, q.Email)
 
@@ -725,42 +735,57 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 	}
 }
 
+func (e *Engine) waitOAuthSlot(ctx context.Context) error {
+	minInterval := time.Duration(e.opt.Cfg.OAuthMinIntervalSec * float64(time.Second))
+	if minInterval < 0 {
+		minInterval = 0
+	}
+	for {
+		e.oauthGateMu.Lock()
+		wait := time.Duration(0)
+		if !e.oauthLastStart.IsZero() && minInterval > 0 {
+			wait = time.Until(e.oauthLastStart.Add(minInterval))
+		}
+		if wait <= 0 {
+			e.oauthLastStart = time.Now()
+			e.oauthGateMu.Unlock()
+			return nil
+		}
+		e.oauthGateMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
 func (e *Engine) oauthWorker(ctx context.Context, id int) {
 	defer e.wgOAuth.Done()
 	log := e.opt.Log
-	minInterval := time.Duration(e.opt.Cfg.OAuthMinIntervalSec * float64(time.Second))
-	if minInterval <= 0 {
-		minInterval = 10 * time.Second
-	}
-	var last time.Time
 	for job := range e.oauthCh {
 		// Soft-stop: still drain with seat accounting, but skip work past target.
 		if int(e.done.Load()) >= e.opt.Target {
 			e.releaseReserve()
 			continue
 		}
-		if !last.IsZero() {
-			if d := time.Until(last.Add(minInterval)); d > 0 {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(d):
-				}
-			}
+		if err := e.waitOAuthSlot(ctx); err != nil {
+			return
 		}
-		last = time.Now()
 		_ = e.opt.Store.Set(func(s *state.Snapshot) {
 			s.Phase = state.PhaseOAuth
 			s.PhaseDetail = fmt.Sprintf("正在 OAuth (%s)", job.Email)
 		})
 		log.Startf("OAuth %s", job.Email)
+		t0 := time.Now()
 		cred, err := e.oauth.Exchange(ctx, job.SSO)
 		if err != nil {
-			log.Warnf("OAuth fail %s: %v", job.Email, err)
+			log.Warnf("OAuth fail %s: %v (%.1fs)", job.Email, err, time.Since(t0).Seconds())
 			e.fail.Add(1)
 			e.releaseReserve()
 			continue
 		}
+		log.Infof("OAuth ok %s (%.1fs)", job.Email, time.Since(t0).Seconds())
 		e.oaN.Add(1)
 		doc := cpa.FromCredential(cred, job.Email)
 		_ = e.opt.Store.Set(func(s *state.Snapshot) {
@@ -768,7 +793,8 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 			s.PhaseDetail = fmt.Sprintf("探活 %s", job.Email)
 		})
 		if e.opt.Cfg.ProbeEnabled {
-			if err := cpa.Probe(doc, e.opt.Cfg.RegisterProxy); err != nil {
+			warmup := e.opt.Cfg.ProbeWarmupSec
+			if err := cpa.Probe(doc, e.opt.Cfg.RegisterProxy, warmup); err != nil {
 				log.Warnf("探活失败 %s: %v", job.Email, err)
 				path, _ := cpa.WriteAtomic(e.opt.Run.Discarded, doc, cpa.DefaultSecret())
 				_ = path
@@ -880,7 +906,22 @@ func deriveWorkers(cfg config.Config) (s, p, c, oa, phys int) {
 	if target < 2 {
 		c = 1
 	}
-	oa = 2
+	// OAuth: default 1 worker when high register concurrency (avoid rate_limited);
+	// allow 2 for small thread counts or explicit OAUTH_WORKERS.
+	oa = cfg.OAuthWorkers
+	if oa <= 0 {
+		if s >= 4 || target >= 8 {
+			oa = 1
+		} else {
+			oa = 2
+		}
+	}
+	if oa > 4 {
+		oa = 4
+	}
+	if oa < 1 {
+		oa = 1
+	}
 	if s < 1 {
 		s = 1
 	}

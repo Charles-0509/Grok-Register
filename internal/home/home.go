@@ -65,12 +65,13 @@ func NewRunID() string {
 
 // RunDirs is created before the first credential file is written.
 type RunDirs struct {
-	RunID  string
-	Root   string
-	SSO    string
-	CPA    string
+	RunID     string
+	Root      string
+	SSO       string
+	CPA       string
+	Grok2API  string // single-token lines for grok2api-style importers
 	Discarded string
-	LogPath string
+	LogPath   string
 }
 
 func (p Paths) PrepareRun(runID string) (RunDirs, error) {
@@ -83,10 +84,11 @@ func (p Paths) PrepareRun(runID string) (RunDirs, error) {
 		Root:      root,
 		SSO:       filepath.Join(root, "SSO"),
 		CPA:       filepath.Join(root, "CPA"),
+		Grok2API:  filepath.Join(root, "grok2api"),
 		Discarded: filepath.Join(root, "discarded"),
 		LogPath:   filepath.Join(p.LogsDir, fmt.Sprintf("run-%s.log", runID)),
 	}
-	for _, d := range []string{rd.Root, rd.SSO, rd.CPA, rd.Discarded} {
+	for _, d := range []string{rd.Root, rd.SSO, rd.CPA, rd.Grok2API, rd.Discarded} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return RunDirs{}, err
 		}
