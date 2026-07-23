@@ -94,7 +94,8 @@ func printHelp() {
   grok start -t N -j M            同上（-j 为 --thread 简写）
   grok status                     查看运行状态与进度
   grok stop                       立即停止注册机
-  grok logs [-f]                  查看最近一次运行日志；-f 实时跟踪
+  grok logs [-f] [--debug|--info|--warn|--error]
+                                  查看最近一次运行日志；-f 实时跟踪
   grok upload                     选择最近 run 的 CPA JSON 上传到 Management API
   grok config                     打开 ~/.grok/config.env（并刷新 config.env.example）
   grok help                       显示帮助
@@ -102,6 +103,8 @@ func printHelp() {
 说明:
   -t / --target   目标账号数 = 探活成功写入 CPA/ 的数量 (1-10000)
   --thread / -j   并发注册/Turnstile 线程数 (1-8)，不再写入 config.env
+  logs 等级:      默认 --info（隐藏 DBG）；--debug 显示全部；--warn / --error 更严
+                  例: grok logs -f --debug
   升级后请查看 ~/.grok/config.env.example 了解新增配置项
 
 数据目录: ~/.grok/ (可用 GROK_HOME 覆盖)
@@ -539,9 +542,52 @@ func stopClearanceStackOnStop(p home.Paths) {
 
 func cmdLogs(args []string) error {
 	follow := false
-	for _, a := range args {
-		if a == "-f" || a == "--follow" {
+	minLevel := logx.LevelInfo // default: hide DBG
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-f" || a == "--follow":
 			follow = true
+		case a == "--debug" || a == "-d" || a == "--verbose" || a == "-v":
+			minLevel = logx.LevelDebug
+		case a == "--info" || a == "-i":
+			minLevel = logx.LevelInfo
+		case a == "--warn" || a == "--warning" || a == "-w":
+			minLevel = logx.LevelWarn
+		case a == "--error" || a == "--err" || a == "-e":
+			minLevel = logx.LevelError
+		case a == "--level" || a == "-l":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--level 需要参数: debug|info|warn|error")
+			}
+			i++
+			lv, err := logx.ParseLevel(args[i])
+			if err != nil {
+				return err
+			}
+			minLevel = lv
+		case strings.HasPrefix(a, "--level="):
+			lv, err := logx.ParseLevel(strings.TrimPrefix(a, "--level="))
+			if err != nil {
+				return err
+			}
+			minLevel = lv
+		case a == "-h" || a == "--help":
+			fmt.Print(`grok logs — 查看 / 跟踪运行日志
+
+用法:
+  grok logs                     打印最近日志（默认 ≥ info，隐藏 DBG）
+  grok logs -f                  实时跟踪
+  grok logs -f --debug          显示 DBG 及全部
+  grok logs --warn              仅警告与错误
+  grok logs --level=error       仅错误
+  grok logs -l debug -f         同上
+
+说明: 磁盘日志始终完整写入；等级只过滤终端显示。
+`)
+			return nil
+		default:
+			return fmt.Errorf("未知 logs 参数: %s（见 grok logs --help）", a)
 		}
 	}
 	p, err := paths()
@@ -552,29 +598,45 @@ func cmdLogs(args []string) error {
 	snap, _ := st.Load()
 	path := snap.LogPath
 	if path == "" {
-		// pick latest in logs dir
 		path = latestLog(p.LogsDir)
 	}
 	if path == "" {
 		return fmt.Errorf("没有日志文件")
 	}
+	levelName := "info"
+	switch {
+	case minLevel <= logx.LevelDebug:
+		levelName = "debug"
+	case minLevel <= logx.LevelInfo:
+		levelName = "info"
+	case minLevel <= logx.LevelWarn:
+		levelName = "warn"
+	default:
+		levelName = "error"
+	}
+
 	if !follow {
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		fmt.Print(string(data))
+		fmt.Print(logx.FilterText(string(data), minLevel))
 		return nil
 	}
-	fmt.Fprintf(os.Stderr, "跟踪 %s (Ctrl-C 退出)\n", path)
+	fmt.Fprintf(os.Stderr, "跟踪 %s  level≥%s  (Ctrl-C 退出)\n", path, levelName)
 	var offset int64
 	if fi, err := os.Stat(path); err == nil {
-		// show last 4k first
-		offset = fi.Size() - 4096
+		// show last ~8k then filter (more room when DBG hidden)
+		chunk := int64(8192)
+		if minLevel <= logx.LevelDebug {
+			chunk = 16384
+		}
+		offset = fi.Size() - chunk
 		if offset < 0 {
 			offset = 0
 		}
 	}
+	var carry string // incomplete line across reads
 	for {
 		f, err := os.Open(path)
 		if err != nil {
@@ -590,8 +652,19 @@ func cmdLogs(args []string) error {
 		for {
 			n, err := f.Read(buf)
 			if n > 0 {
-				_, _ = os.Stdout.Write(buf[:n])
 				offset += int64(n)
+				carry += string(buf[:n])
+				for {
+					i := strings.IndexByte(carry, '\n')
+					if i < 0 {
+						break
+					}
+					line := carry[:i]
+					carry = carry[i+1:]
+					if logx.KeepLine(line, minLevel) {
+						fmt.Println(line)
+					}
+				}
 			}
 			if err != nil {
 				break
