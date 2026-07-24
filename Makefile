@@ -34,9 +34,11 @@ install:
 	install -d $(SHAREDIR)
 	install -m 755 scripts/turnstile_mint.py $(SHAREDIR)/turnstile_mint.py
 	install -m 755 scripts/turnstile_pool.py $(SHAREDIR)/turnstile_pool.py
+	install -m 755 scripts/oauth_device_approve.py $(SHAREDIR)/oauth_device_approve.py
 	@echo "installed: $(BINDIR)/$(APP)"
 	@echo "installed: $(SHAREDIR)/turnstile_mint.py"
 	@echo "installed: $(SHAREDIR)/turnstile_pool.py"
+	@echo "installed: $(SHAREDIR)/oauth_device_approve.py"
 	@echo "try: $(APP) help"
 	@echo "Turnstile: pip install -r scripts/requirements-turnstile.txt && python -m cloakbrowser install"
 	@echo "一键部署: scripts/install.sh --help"

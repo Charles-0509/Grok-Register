@@ -347,6 +347,10 @@ func (e *Engine) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	e.oauth.SetDeviceMode(cfg.OAuthDeviceMode)
+	if m := strings.ToLower(strings.TrimSpace(cfg.OAuthDeviceMode)); m != "" && m != "http" {
+		log.Infof("OAuth device mode=%s (browser approve script=%v)", m, oauthDeviceScriptOK())
+	}
 
 	_ = st.Set(func(s *state.Snapshot) {
 		s.Phase = state.PhaseRegister
@@ -416,6 +420,7 @@ func (e *Engine) run(ctx context.Context) error {
 	// Rebuild oauth client after clearance manager may have been attached.
 	if e.cm != nil {
 		if oc, oerr := oauth.NewClient(cfg.RegisterProxy, e.cm, time.Duration(cfg.OAuthRetrySec)*time.Second); oerr == nil {
+			oc.SetDeviceMode(cfg.OAuthDeviceMode)
 			e.oauth = oc
 		}
 	}
@@ -1030,4 +1035,17 @@ func trim(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+func oauthDeviceScriptOK() bool {
+	// lightweight probe: python script used by browser device mode
+	for _, p := range []string{
+		"/usr/local/share/grok-reg/oauth_device_approve.py",
+		"/opt/Grok-Register/scripts/oauth_device_approve.py",
+	} {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return true
+		}
+	}
+	return false
 }

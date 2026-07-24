@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +57,11 @@ type Client struct {
 	ua    string
 	clear *clearance.Manager
 
+	// DeviceMode: http | browser | auto (default http)
+	DeviceMode string
+	// ProxyURL is the register proxy (for browser subprocess).
+	ProxyURL string
+
 	// rate limit gate
 	mu         sync.Mutex
 	trippedAt  time.Time
@@ -95,15 +101,30 @@ func NewClient(proxy string, cm *clearance.Manager, baseCooldown time.Duration) 
 				return http.ErrUseLastResponse
 			},
 		},
-		ua:       DefaultUA,
-		clear:    cm,
-		baseCool: baseCooldown,
-		cooldown: baseCooldown,
+		ua:         DefaultUA,
+		clear:      cm,
+		baseCool:   baseCooldown,
+		cooldown:   baseCooldown,
+		ProxyURL:   proxy,
+		DeviceMode: DeviceModeHTTP,
 	}
 	if cm != nil {
 		c.ua = cm.UserAgent()
 	}
 	return c, nil
+}
+
+// SetDeviceMode sets http|browser|auto.
+func (c *Client) SetDeviceMode(mode string) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case DeviceModeBrowser, DeviceModeAuto, DeviceModeHTTP:
+		c.DeviceMode = mode
+	case "":
+		c.DeviceMode = DeviceModeHTTP
+	default:
+		c.DeviceMode = DeviceModeHTTP
+	}
 }
 
 func (c *Client) WaitRateLimit(ctx context.Context) error {
@@ -882,31 +903,68 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (Credential, 
 	return Credential{}, fmt.Errorf("refresh_rejected: %s", errCode)
 }
 
-// Exchange is convenience: start flow + confirm HTTP + poll.
+// confirmDevice runs HTTP and/or browser consent per DeviceMode.
+func (c *Client) confirmDevice(ctx context.Context, sso string, flow DeviceFlow, forceBrowser bool) error {
+	mode := strings.ToLower(strings.TrimSpace(c.DeviceMode))
+	if mode == "" {
+		mode = DeviceModeHTTP
+	}
+	useBrowser := forceBrowser || mode == DeviceModeBrowser
+	if useBrowser {
+		// Ensure child sees proxy
+		if c.ProxyURL != "" {
+			_ = os.Setenv("REGISTER_PROXY", c.ProxyURL)
+		}
+		return c.ConfirmBrowser(ctx, sso, flow)
+	}
+	return c.ConfirmHTTP(ctx, sso, flow)
+}
+
+// Exchange is convenience: start flow + confirm + poll.
+// DeviceMode auto: HTTP first; on invalid_grant retry same flow? no — new device + browser.
 // On rate_limited / device 429 / invalid_grant, retry with a fresh device code.
 func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
+	mode := strings.ToLower(strings.TrimSpace(c.DeviceMode))
+	if mode == "" {
+		mode = DeviceModeHTTP
+	}
 	var last error
-	for attempt := 0; attempt < 3; attempt++ {
+	browserForced := mode == DeviceModeBrowser
+	maxAttempt := 3
+	if mode == DeviceModeAuto {
+		maxAttempt = 4 // room for HTTP tries + browser try
+	}
+	for attempt := 0; attempt < maxAttempt; attempt++ {
 		if err := c.WaitRateLimit(ctx); err != nil {
 			return Credential{}, err
 		}
 		flow, err := c.StartDeviceFlow(ctx)
 		if err != nil {
 			last = err
-			if (errors.Is(err, ErrRateLimited) || strings.Contains(err.Error(), "status=429")) && attempt < 2 {
+			if (errors.Is(err, ErrRateLimited) || strings.Contains(err.Error(), "status=429")) && attempt < maxAttempt-1 {
 				continue
 			}
 			return Credential{}, err
 		}
-		if err := c.ConfirmHTTP(ctx, sso, flow); err != nil {
+		// auto: after HTTP invalid_grant, switch remaining attempts to browser
+		if err := c.confirmDevice(ctx, sso, flow, browserForced); err != nil {
 			last = err
-			if errors.Is(err, ErrRateLimited) && attempt < 2 {
+			if errors.Is(err, ErrRateLimited) && attempt < maxAttempt-1 {
 				continue
 			}
-			// challenge / unknown_page: one more full attempt with new device code
-			if attempt < 2 && (strings.Contains(err.Error(), "challenge") ||
+			if attempt < maxAttempt-1 && (strings.Contains(err.Error(), "challenge") ||
 				strings.Contains(err.Error(), "unknown_page") ||
-				strings.Contains(err.Error(), "device_verify")) {
+				strings.Contains(err.Error(), "device_verify") ||
+				strings.Contains(err.Error(), "browser_device")) {
+				if mode == DeviceModeAuto && strings.Contains(err.Error(), "browser_device") {
+					// browser itself failed — retry browser
+					browserForced = true
+				}
+				continue
+			}
+			// HTTP incomplete: in auto mode try browser next
+			if mode == DeviceModeAuto && !browserForced {
+				browserForced = true
 				continue
 			}
 			return Credential{}, err
@@ -914,8 +972,12 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 		cred, err := c.PollToken(ctx, flow)
 		if err != nil {
 			last = err
-			// invalid_grant: consent did not stick — new device flow
-			if attempt < 2 && strings.Contains(err.Error(), "invalid_grant") {
+			// invalid_grant after HTTP "success": new accounts — fall back to browser
+			if mode == DeviceModeAuto && !browserForced && strings.Contains(err.Error(), "invalid_grant") {
+				browserForced = true
+				continue
+			}
+			if attempt < maxAttempt-1 && strings.Contains(err.Error(), "invalid_grant") {
 				continue
 			}
 			return Credential{}, err
