@@ -11,15 +11,31 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export FLARESOLVERR_URL="${FLARESOLVERR_URL:-http://127.0.0.1:8191}"
-export CLEARANCE_TIMEOUT_SEC="${CLEARANCE_TIMEOUT_SEC:-60}"
+export CLEARANCE_TIMEOUT_SEC="${CLEARANCE_TIMEOUT_SEC:-90}"
 
 if [[ "${1:-}" == "--direct" ]]; then
   export CLEARANCE_PROXY=""
 elif [[ -n "${CLEARANCE_PROXY+x}" ]]; then
   : # keep caller value (including empty)
 else
-  export CLEARANCE_PROXY="${CLEARANCE_PROXY:-}"
+  # Default: FS browser exits via compose Privoxy→WARP (NOT host network).
+  # Bare prewarm without proxy often gets Connection reset (FS has no WARP).
+  export CLEARANCE_PROXY="${CLEARANCE_PROXY:-http://privoxy:8118}"
 fi
+
+# Wait until FlareSolverr answers (compose health: starting is too early).
+echo "[prewarm] waiting for flaresolverr at ${FLARESOLVERR_URL} …"
+for i in $(seq 1 40); do
+  if curl -fsS -m 2 "${FLARESOLVERR_URL}/" >/dev/null 2>&1; then
+    echo "[prewarm] flaresolverr ready (${i}s)"
+    break
+  fi
+  if [[ "$i" -eq 40 ]]; then
+    echo "[prewarm] ERROR: flaresolverr not ready after 40s — docker compose ps / logs" >&2
+    exit 1
+  fi
+  sleep 1
+done
 
 # Prefer project helper when venv/python path exists; always fall back to stdlib.
 exec python3 - <<'PY'
