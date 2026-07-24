@@ -735,6 +735,13 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 		}
 		n := e.ssoN.Add(1)
 		log.OKf("注册成功 #%d %s", n, q.Email)
+		// Brief settle: brand-new SSO sometimes rejected by auth.x.ai device verify (→ sign-in / invalid_grant).
+		select {
+		case <-ctx.Done():
+			e.releaseReserve()
+			return
+		case <-time.After(2 * time.Second):
+		}
 
 		job := SSOJob{Email: q.Email, Password: q.Password, SSO: sso}
 		select {
