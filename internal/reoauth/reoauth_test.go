@@ -32,6 +32,23 @@ func TestParseInspectionJSON(t *testing.T) {
 	}
 }
 
+func TestParseInspectionJSONBOM(t *testing.T) {
+	body := `{"filter":"quota_exhausted","count":1,"results":[{"email":"c@example.com"}]}`
+	raw := append([]byte{0xef, 0xbb, 0xbf}, []byte(body)...)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "bom.json")
+	if err := os.WriteFile(p, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	accs, err := ParsePath(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accs) != 1 || accs[0].Email != "c@example.com" {
+		t.Fatalf("%+v", accs)
+	}
+}
+
 func TestParseCPAJSON(t *testing.T) {
 	raw := `{
   "type": "xai",

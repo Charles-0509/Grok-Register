@@ -62,6 +62,18 @@ func logf(opt Options, f string, a ...any) {
 	}
 }
 
+// stripBOM removes UTF-8 BOM (common in browser-exported JSON).
+func stripBOM(raw []byte) []byte {
+	if len(raw) >= 3 && raw[0] == 0xef && raw[1] == 0xbb && raw[2] == 0xbf {
+		return raw[3:]
+	}
+	// UTF-16 LE BOM — rare but cheap to drop first two if paired with nulls later
+	if len(raw) >= 2 && raw[0] == 0xff && raw[1] == 0xfe {
+		return raw[2:]
+	}
+	return raw
+}
+
 // ParsePath loads accounts from inspection JSON, CPA JSON, accounts.txt, auth-sessions.jsonl, or a directory.
 func ParsePath(path string) ([]Account, error) {
 	st, err := os.Stat(path)
@@ -75,6 +87,7 @@ func ParsePath(path string) ([]Account, error) {
 	if err != nil {
 		return nil, err
 	}
+	raw = stripBOM(raw)
 	name := strings.ToLower(filepath.Base(path))
 	// accounts.txt style
 	if name == "accounts.txt" || looksLikeAccountsTXT(raw) {
@@ -230,6 +243,7 @@ func parseAuthSessions(path string, raw []byte) ([]Account, error) {
 }
 
 func parseJSON(path string, raw []byte) ([]Account, error) {
+	raw = stripBOM(raw)
 	// 1) CPA document
 	var cpaDoc cpa.Document
 	if err := json.Unmarshal(raw, &cpaDoc); err == nil && (cpaDoc.RefreshToken != "" || cpaDoc.AccessToken != "") {
