@@ -190,39 +190,53 @@ async def approve(
                 print("ok", flush=True)
                 return
 
-            # Click Allow — prefer button with text Allow / 允许
-            clicked = False
-            for selector in (
-                'button:has-text("Allow")',
-                'button:has-text("允许")',
-                'form[action*="device/approve"] button[type="submit"]',
-                'button[type="submit"]',
-            ):
-                try:
-                    loc = page.locator(selector)
-                    n = await loc.count()
-                    if n == 0:
-                        continue
-                    # Prefer last submit if multiple (Deny then Allow often)
-                    target = loc.nth(n - 1) if n > 1 and "submit" in selector else loc.first
-                    text = (await target.inner_text()).strip().lower()
-                    if "deny" in text or "拒绝" in text:
-                        if n > 1:
-                            target = loc.nth(n - 1)
-                            text = (await target.inner_text()).strip().lower()
-                        if "deny" in text or "拒绝" in text:
+            async def click_best_button() -> str:
+                """Click Allow/Continue; never Deny. Returns action label."""
+                # Collect candidate buttons
+                buttons = page.locator("button")
+                n = await buttons.count()
+                candidates: list[tuple[int, str, int]] = []  # score, text, index
+                for i in range(n):
+                    try:
+                        b = buttons.nth(i)
+                        if not await b.is_visible():
                             continue
-                    await target.click(timeout=8000)
-                    clicked = True
-                    print(f"clicked {selector!r} text={text!r}", file=sys.stderr)
-                    break
-                except Exception as e:
-                    print(f"click try {selector}: {e}", file=sys.stderr)
+                        text = (await b.inner_text()).strip()
+                        low = text.lower()
+                        if not text:
+                            continue
+                        if any(x in low for x in ("deny", "拒绝", "cancel", "取消")):
+                            continue
+                        score = 0
+                        if "allow" in low or "允许" in text or "授权" in text:
+                            score = 100
+                        elif "authorize" in low or "approve" in low or "确认" in text:
+                            score = 90
+                        elif "continue" in low or "继续" in text or "next" in low:
+                            score = 50
+                        elif "submit" in low:
+                            score = 20
+                        else:
+                            # form submit without label — low priority
+                            typ = await b.get_attribute("type")
+                            if typ == "submit":
+                                score = 10
+                            else:
+                                continue
+                        candidates.append((score, text, i))
+                    except Exception:
+                        continue
+                if not candidates:
+                    return ""
+                candidates.sort(key=lambda x: (-x[0], x[2]))
+                score, text, idx = candidates[0]
+                await buttons.nth(idx).click(timeout=8000)
+                print(f"clicked score={score} text={text!r}", file=sys.stderr)
+                return text.lower()
 
-            if not clicked:
-                # Fallback: set hidden action=allow and submit form via JS
+            async def js_submit_allow() -> bool:
                 try:
-                    await page.evaluate(
+                    ok = await page.evaluate(
                         """() => {
                         const f = document.querySelector('form[action*="device/approve"]')
                           || document.querySelector('form');
@@ -237,22 +251,52 @@ async def approve(
                         return true;
                     }"""
                     )
-                    clicked = True
-                    print("form submit via JS action=allow", file=sys.stderr)
+                    if ok:
+                        print("form submit via JS action=allow", file=sys.stderr)
+                    return bool(ok)
                 except Exception as e:
-                    raise RuntimeError(f"no_allow_button: {e}") from e
+                    print(f"js submit fail: {e}", file=sys.stderr)
+                    return False
+
+            # Multi-step consent: Continue → Allow (or Allow directly)
+            for step in range(5):
+                if await page_says_done():
+                    print("ok", flush=True)
+                    return
+                label = await click_best_button()
+                if not label:
+                    if await js_submit_allow():
+                        await page.wait_for_timeout(1500)
+                        if await page_says_done():
+                            print("ok", flush=True)
+                            return
+                    break
+                await page.wait_for_timeout(1500)
+                # if we clicked continue, loop to click allow next
+                if "allow" in label or "允许" in label or "authorize" in label:
+                    # may still need brief wait for navigation
+                    await page.wait_for_timeout(1000)
+                    if await page_says_done():
+                        print("ok", flush=True)
+                        return
+                    # try js submit once more if still on consent
+                    if "consent" in page.url or "device" in page.url:
+                        await js_submit_allow()
+                        await page.wait_for_timeout(1500)
 
             # Wait for done
             while time.time() < deadline:
                 if await page_says_done():
                     print("ok", flush=True)
                     return
-                # follow soft navigations
+                # retry Allow if still on consent
+                if "consent" in page.url or "/oauth2/device" in page.url:
+                    await click_best_button()
                 await page.wait_for_timeout(500)
 
             # dump hint
             try:
-                body = (await page.inner_text("body"))[:300].replace("\n", " ")
+                body = (await page.inner_text("body"))[:400].replace("\n", " ")
             except Exception:
                 body = ""
             raise RuntimeError(
