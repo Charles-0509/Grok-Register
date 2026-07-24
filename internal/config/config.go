@@ -19,6 +19,9 @@ const (
 	EmailTempmail EmailMode = "tempmail"
 	EmailTestmail EmailMode = "testmail"
 	EmailCustom   EmailMode = "custom"
+	// EmailCFTemp = dreamhunter2333/cloudflare_temp_email self-hosted Worker
+	// Docs: https://github.com/dreamhunter2333/cloudflare_temp_email
+	EmailCFTemp EmailMode = "cf_temp_email"
 )
 
 type Config struct {
@@ -30,6 +33,18 @@ type Config struct {
 	TestmailAPIKey    string
 	TestmailNamespace string
 	TestmailDomain    string // default inbox.testmail.app
+
+	// cloudflare_temp_email (self-hosted dreamhunter2333 Worker)
+	// CF_TEMP_EMAIL_API   Worker root URL, e.g. https://mail-api.example.com
+	// CF_TEMP_EMAIL_ADMIN x-admin-auth password (preferred: POST /admin/new_address)
+	// CF_TEMP_EMAIL_DOMAIN optional fixed domain; empty = Worker picks from DOMAINS
+	// CF_TEMP_EMAIL_AUTH optional site password (x-custom-auth)
+	// CF_TEMP_EMAIL_PREFIX 1=enablePrefix on admin create (default 1)
+	CFTempEmailAPI    string
+	CFTempEmailAdmin  string
+	CFTempEmailDomain string
+	CFTempEmailAuth   string
+	CFTempEmailPrefix bool
 
 	ClearanceEnabled bool
 	// ClearanceMode: auto | always | never
@@ -91,6 +106,7 @@ func Defaults() Config {
 		EmailMode:             EmailTempmail,
 		EmailAPI:              "http://127.0.0.1:8080",
 		TestmailDomain:        "inbox.testmail.app",
+		CFTempEmailPrefix:     true,
 		ClearanceEnabled:      true,
 		ClearanceMode:         "auto",
 		ClearanceAutoStop:     true,
@@ -206,10 +222,17 @@ func Save(path string, cfg Config) error {
 	if cfg.EmailAPI != "" {
 		b.WriteString(fmt.Sprintf("EMAIL_API=%s\n", cfg.EmailAPI))
 	}
-	// testmail secrets: never auto-written (set manually)
+	// testmail / cf_temp secrets: never auto-written (set manually)
 	if cfg.TestmailDomain != "" {
 		b.WriteString(fmt.Sprintf("TESTMAIL_DOMAIN=%s\n", cfg.TestmailDomain))
 	}
+	if cfg.CFTempEmailAPI != "" {
+		b.WriteString(fmt.Sprintf("CF_TEMP_EMAIL_API=%s\n", cfg.CFTempEmailAPI))
+	}
+	if cfg.CFTempEmailDomain != "" {
+		b.WriteString(fmt.Sprintf("CF_TEMP_EMAIL_DOMAIN=%s\n", cfg.CFTempEmailDomain))
+	}
+	b.WriteString(fmt.Sprintf("CF_TEMP_EMAIL_PREFIX=%s\n", bool01(cfg.CFTempEmailPrefix)))
 	b.WriteString(fmt.Sprintf("CLEARANCE_ENABLED=%s\n", bool01(cfg.ClearanceEnabled)))
 	if cfg.ClearanceMode != "" {
 		b.WriteString(fmt.Sprintf("CLEARANCE_MODE=%s\n", cfg.ClearanceMode))
@@ -268,8 +291,9 @@ func InteractiveSetup(path string) (Config, error) {
 	fmt.Println("选择邮箱模式:")
 	fmt.Println("  [1] 免费临时邮箱           (tempmail.lol · 默认 · 直接回车)")
 	fmt.Println("  [2] testmail.app           (GitHub Student Pack Essential 等)")
-	fmt.Println("  [3] 自建域名邮箱           (Cloudflare Email Routing + webhook)")
-	fmt.Print("输入 1 / 2 / 3 [1]: ")
+	fmt.Println("  [3] 自建域名 webhook       (Cloudflare Email Routing + 本地 webhook)")
+	fmt.Println("  [4] cloudflare_temp_email  (dreamhunter2333 自建 Worker API)")
+	fmt.Print("输入 1 / 2 / 3 / 4 [1]: ")
 	reader := bufio.NewReader(os.Stdin)
 	line, _ := reader.ReadString('\n')
 	line = strings.TrimSpace(line)
@@ -311,6 +335,25 @@ func InteractiveSetup(path string) (Config, error) {
 		overrides["EMAIL_MODE"] = string(EmailCustom)
 		overrides["EMAIL_DOMAIN"] = cfg.EmailDomain
 		overrides["EMAIL_API"] = cfg.EmailAPI
+	case "4":
+		cfg.EmailMode = EmailCFTemp
+		fmt.Print("  CF_TEMP_EMAIL_API (Worker 根地址, https://...): ")
+		api, _ := reader.ReadString('\n')
+		cfg.CFTempEmailAPI = strings.TrimRight(strings.TrimSpace(api), "/")
+		fmt.Print("  CF_TEMP_EMAIL_ADMIN (x-admin-auth): ")
+		adm, _ := reader.ReadString('\n')
+		cfg.CFTempEmailAdmin = strings.TrimSpace(adm)
+		fmt.Print("  CF_TEMP_EMAIL_DOMAIN (可选，回车=Worker 已配置域名随机): ")
+		dom, _ := reader.ReadString('\n')
+		cfg.CFTempEmailDomain = strings.TrimSpace(dom)
+		fmt.Print("  CF_TEMP_EMAIL_AUTH (可选 x-custom-auth, 回车跳过): ")
+		auth, _ := reader.ReadString('\n')
+		cfg.CFTempEmailAuth = strings.TrimSpace(auth)
+		cfg.CFTempEmailPrefix = true
+		overrides["EMAIL_MODE"] = string(EmailCFTemp)
+		overrides["CF_TEMP_EMAIL_API"] = cfg.CFTempEmailAPI
+		overrides["CF_TEMP_EMAIL_DOMAIN"] = cfg.CFTempEmailDomain
+		overrides["CF_TEMP_EMAIL_PREFIX"] = "1"
 	default:
 		cfg.EmailMode = EmailTempmail
 		overrides["EMAIL_MODE"] = string(EmailTempmail)
@@ -318,6 +361,27 @@ func InteractiveSetup(path string) (Config, error) {
 	// Full sectioned Chinese template (includes CPA_MANAGEMENT_KEY= placeholder)
 	if err := SeedFromExample(path, overrides); err != nil {
 		return cfg, err
+	}
+	// Append secrets not written into example overrides as empty placeholders
+	if cfg.EmailMode == EmailTestmail && cfg.TestmailAPIKey != "" {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err == nil {
+			fmt.Fprintf(f, "\n# secrets (append)\nTESTMAIL_API_KEY=%s\nTESTMAIL_NAMESPACE=%s\n", cfg.TestmailAPIKey, cfg.TestmailNamespace)
+			_ = f.Close()
+		}
+	}
+	if cfg.EmailMode == EmailCFTemp {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err == nil {
+			fmt.Fprintf(f, "\n# secrets (append — not rewritten by Save)\n")
+			if cfg.CFTempEmailAdmin != "" {
+				fmt.Fprintf(f, "CF_TEMP_EMAIL_ADMIN=%s\n", cfg.CFTempEmailAdmin)
+			}
+			if cfg.CFTempEmailAuth != "" {
+				fmt.Fprintf(f, "CF_TEMP_EMAIL_AUTH=%s\n", cfg.CFTempEmailAuth)
+			}
+			_ = f.Close()
+		}
 	}
 	fmt.Printf("[*] 已写入分区注释配置 %s\n", path)
 	fmt.Printf("[*] 参考模板也会同步到同目录 config.env.example\n")
@@ -384,7 +448,14 @@ func parseEnvFile(content string) map[string]string {
 
 func applyMap(cfg *Config, env map[string]string) {
 	if v, ok := env["EMAIL_MODE"]; ok {
-		cfg.EmailMode = EmailMode(strings.ToLower(v))
+		mode := strings.ToLower(strings.TrimSpace(v))
+		// convenience aliases for cloudflare_temp_email
+		switch mode {
+		case "cf_temp", "cf-temp", "cftemp", "cloudflare_temp_email", "cloudflare-temp-email":
+			cfg.EmailMode = EmailCFTemp
+		default:
+			cfg.EmailMode = EmailMode(mode)
+		}
 	}
 	if v, ok := env["EMAIL_DOMAIN"]; ok {
 		cfg.EmailDomain = v
@@ -400,6 +471,30 @@ func applyMap(cfg *Config, env map[string]string) {
 	}
 	if v, ok := env["TESTMAIL_DOMAIN"]; ok {
 		cfg.TestmailDomain = v
+	}
+	// cloudflare_temp_email
+	if v, ok := env["CF_TEMP_EMAIL_API"]; ok {
+		cfg.CFTempEmailAPI = strings.TrimRight(strings.TrimSpace(v), "/")
+	} else if v, ok := env["CFTEMP_API"]; ok {
+		cfg.CFTempEmailAPI = strings.TrimRight(strings.TrimSpace(v), "/")
+	}
+	if v, ok := env["CF_TEMP_EMAIL_ADMIN"]; ok {
+		cfg.CFTempEmailAdmin = v
+	} else if v, ok := env["CFTEMP_ADMIN"]; ok {
+		cfg.CFTempEmailAdmin = v
+	}
+	if v, ok := env["CF_TEMP_EMAIL_DOMAIN"]; ok {
+		cfg.CFTempEmailDomain = v
+	} else if v, ok := env["CFTEMP_DOMAIN"]; ok {
+		cfg.CFTempEmailDomain = v
+	}
+	if v, ok := env["CF_TEMP_EMAIL_AUTH"]; ok {
+		cfg.CFTempEmailAuth = v
+	} else if v, ok := env["CFTEMP_AUTH"]; ok {
+		cfg.CFTempEmailAuth = v
+	}
+	if v, ok := env["CF_TEMP_EMAIL_PREFIX"]; ok {
+		cfg.CFTempEmailPrefix = truthy(v)
 	}
 	if v, ok := env["CLEARANCE_ENABLED"]; ok {
 		cfg.ClearanceEnabled = truthy(v)

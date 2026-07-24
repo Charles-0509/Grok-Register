@@ -43,7 +43,7 @@ services:
       start_period: 30s
 
   privoxy:
-    image: vimagick/privoxy:latest
+    image: lusky3/privoxy:latest
     container_name: grok-clearance-privoxy
     restart: unless-stopped
     depends_on:

@@ -16,11 +16,11 @@ import (
 )
 
 var bannedDomains = map[string]struct{}{
-	"duckmail.sbs":     {},
-	"web-library.net":  {},
-	"mail.tm":          {},
-	"mail.gw":          {},
-	"baldur.edu.kg":    {},
+	"duckmail.sbs":    {},
+	"web-library.net": {},
+	"mail.tm":         {},
+	"mail.gw":         {},
+	"baldur.edu.kg":   {},
 }
 
 var codeRe = []*regexp.Regexp{
@@ -30,14 +30,16 @@ var codeRe = []*regexp.Regexp{
 }
 
 type Handle struct {
-	Kind     string // lol | mt | custom | testmail
+	Kind     string // lol | mt | custom | testmail | cftemp
 	Email    string
 	Password string
 	Token    string
-	Base     string // mail.tm base
+	Base     string // mail.tm base or cf_temp worker root
 	// testmail.app
 	Tag       string
 	Timestamp int64 // ms — only accept mails after Create()
+	// cloudflare_temp_email
+	AddressID int64
 }
 
 type Provider struct {
@@ -57,7 +59,13 @@ type Config struct {
 	TestmailAPIKey    string
 	TestmailNamespace string
 	TestmailDomain    string
-	HTTPClient        *http.Client
+	// cloudflare_temp_email (dreamhunter2333)
+	CFTempAPI    string
+	CFTempAdmin  string
+	CFTempDomain string
+	CFTempAuth   string // optional x-custom-auth
+	CFTempPrefix bool
+	HTTPClient   *http.Client
 }
 
 func New(cfg Config) *Provider {
@@ -90,6 +98,13 @@ func (p *Provider) Create() (Handle, error) {
 		return Handle{Kind: "custom", Email: email, Password: password}, nil
 	case config.EmailTestmail:
 		h, err := p.testmailCreate()
+		if err != nil {
+			return Handle{}, err
+		}
+		h.Password = password
+		return h, nil
+	case config.EmailCFTemp:
+		h, err := p.cfTempCreate()
 		if err != nil {
 			return Handle{}, err
 		}
@@ -336,9 +351,258 @@ func (p *Provider) fetch(h Handle) (string, error) {
 		return string(b2), nil
 	case "testmail":
 		return p.testmailFetch(h)
+	case "cftemp":
+		return p.cfTempFetch(h)
 	default:
 		return "", fmt.Errorf("unknown handle kind")
 	}
+}
+
+// cfTempCreate creates a mailbox via cloudflare_temp_email Worker.
+// Preferred: POST /admin/new_address with x-admin-auth (no Turnstile).
+// Fallback: POST /api/new_address when admin is empty (needs ENABLE_USER_CREATE_EMAIL).
+// Ref: https://github.com/dreamhunter2333/cloudflare_temp_email
+//
+// CF_TEMP_EMAIL_DOMAIN is optional: leave empty to let Worker pick from its
+// configured DOMAINS / DEFAULT_DOMAINS (random or first, per Worker env).
+func (p *Provider) cfTempCreate() (Handle, error) {
+	base := strings.TrimRight(strings.TrimSpace(p.cfg.CFTempAPI), "/")
+	if base == "" {
+		// allow reuse of EMAIL_API for convenience
+		base = strings.TrimRight(strings.TrimSpace(p.cfg.API), "/")
+	}
+	if base == "" {
+		return Handle{}, fmt.Errorf("cf_temp_email: set CF_TEMP_EMAIL_API (Worker root URL)")
+	}
+	domain := strings.TrimSpace(p.cfg.CFTempDomain)
+	if domain == "" {
+		domain = strings.TrimSpace(p.cfg.Domain)
+	}
+	// domain empty → Worker auto-selects from configured domains (random/default)
+	name := "oc" + randStr(10)
+	payload := map[string]any{
+		"name":         name,
+		"enablePrefix": p.cfg.CFTempPrefix,
+	}
+	if domain != "" {
+		payload["domain"] = domain
+	}
+	raw, _ := json.Marshal(payload)
+
+	// 1) admin path
+	admin := strings.TrimSpace(p.cfg.CFTempAdmin)
+	if admin != "" {
+		req, err := http.NewRequest(http.MethodPost, base+"/admin/new_address", strings.NewReader(string(raw)))
+		if err != nil {
+			return Handle{}, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("x-admin-auth", admin)
+		if a := strings.TrimSpace(p.cfg.CFTempAuth); a != "" {
+			req.Header.Set("x-custom-auth", a)
+		}
+		resp, err := p.cfg.HTTPClient.Do(req)
+		if err != nil {
+			return Handle{}, err
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return p.cfTempParseCreate(body, base)
+		}
+		return Handle{}, fmt.Errorf("cf_temp_email admin/new_address http=%d body=%s", resp.StatusCode, truncate(string(body), 120))
+	}
+
+	// 2) public /api/new_address — if domain still empty, try open_api/settings
+	if domain == "" {
+		if d, err := p.cfTempPickDomain(base); err == nil && d != "" {
+			payload["domain"] = d
+			raw, _ = json.Marshal(payload)
+		}
+	}
+	req, err := http.NewRequest(http.MethodPost, base+"/api/new_address", strings.NewReader(string(raw)))
+	if err != nil {
+		return Handle{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if a := strings.TrimSpace(p.cfg.CFTempAuth); a != "" {
+		req.Header.Set("x-custom-auth", a)
+	}
+	resp, err := p.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return Handle{}, err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return Handle{}, fmt.Errorf("cf_temp_email api/new_address http=%d body=%s (prefer CF_TEMP_EMAIL_ADMIN)", resp.StatusCode, truncate(string(body), 120))
+	}
+	return p.cfTempParseCreate(body, base)
+}
+
+// cfTempPickDomain reads GET /open_api/settings and returns a random domain.
+// Used when public create needs an explicit domain and config left it empty.
+func (p *Provider) cfTempPickDomain(base string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, base+"/open_api/settings", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	if a := strings.TrimSpace(p.cfg.CFTempAuth); a != "" {
+		req.Header.Set("x-custom-auth", a)
+	}
+	resp, err := p.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("settings http=%d", resp.StatusCode)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(body, &data); err != nil {
+		return "", err
+	}
+	// prefer defaultDomains, then domains
+	var list []string
+	for _, key := range []string{"defaultDomains", "domains"} {
+		switch v := data[key].(type) {
+		case []any:
+			for _, it := range v {
+				if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
+					list = append(list, strings.TrimSpace(s))
+				}
+			}
+		case []string:
+			for _, s := range v {
+				if strings.TrimSpace(s) != "" {
+					list = append(list, strings.TrimSpace(s))
+				}
+			}
+		}
+		if len(list) > 0 {
+			break
+		}
+	}
+	if len(list) == 0 {
+		return "", fmt.Errorf("no domains in open_api/settings")
+	}
+	return list[rand.Intn(len(list))], nil
+}
+
+func (p *Provider) cfTempParseCreate(body []byte, base string) (Handle, error) {
+	var data map[string]any
+	if err := json.Unmarshal(body, &data); err != nil {
+		return Handle{}, fmt.Errorf("cf_temp_email create json: %w body=%s", err, truncate(string(body), 80))
+	}
+	addr, _ := data["address"].(string)
+	jwt, _ := data["jwt"].(string)
+	if addr == "" || jwt == "" {
+		return Handle{}, fmt.Errorf("cf_temp_email create missing address/jwt: %s", truncate(string(body), 120))
+	}
+	var aid int64
+	switch v := data["address_id"].(type) {
+	case float64:
+		aid = int64(v)
+	case json.Number:
+		n, _ := v.Int64()
+		aid = n
+	}
+	return Handle{
+		Kind:      "cftemp",
+		Email:     addr,
+		Token:     jwt,
+		Base:      base,
+		AddressID: aid,
+		Timestamp: time.Now().UnixMilli(),
+	}, nil
+}
+
+// cfTempFetch pulls mails. Prefers GET /api/parsed_mails (subject/text/html),
+// falls back to GET /api/mails (raw RFC822).
+func (p *Provider) cfTempFetch(h Handle) (string, error) {
+	base := strings.TrimRight(h.Base, "/")
+	if base == "" {
+		base = strings.TrimRight(strings.TrimSpace(p.cfg.CFTempAPI), "/")
+	}
+	if base == "" || h.Token == "" {
+		return "", fmt.Errorf("cf_temp_email not configured")
+	}
+	// try parsed first
+	text, err := p.cfTempGet(base+"/api/parsed_mails?limit=10&offset=0", h.Token, true)
+	if err == nil && text != "" {
+		return text, nil
+	}
+	// fallback raw list
+	text2, err2 := p.cfTempGet(base+"/api/mails?limit=10&offset=0", h.Token, false)
+	if err2 != nil {
+		if err != nil {
+			return "", fmt.Errorf("cf_temp_email fetch: parsed=%v raw=%v", err, err2)
+		}
+		return "", err2
+	}
+	return text2, nil
+}
+
+func (p *Provider) cfTempGet(u, jwt string, parsed bool) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Accept", "application/json")
+	if a := strings.TrimSpace(p.cfg.CFTempAuth); a != "" {
+		req.Header.Set("x-custom-auth", a)
+	}
+	resp, err := p.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode == 404 && parsed {
+		return "", fmt.Errorf("parsed_mails 404")
+	}
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("http=%d body=%s", resp.StatusCode, truncate(string(body), 80))
+	}
+	var data map[string]any
+	if err := json.Unmarshal(body, &data); err != nil {
+		// maybe bare array
+		var arr []any
+		if err2 := json.Unmarshal(body, &arr); err2 == nil {
+			return cfTempJoinMails(arr, parsed), nil
+		}
+		return string(body), nil
+	}
+	results, _ := data["results"].([]any)
+	if results == nil {
+		results, _ = data["mails"].([]any)
+	}
+	if results == nil {
+		// single object
+		return cfTempJoinMails([]any{data}, parsed), nil
+	}
+	return cfTempJoinMails(results, parsed), nil
+}
+
+func cfTempJoinMails(items []any, parsed bool) string {
+	var b strings.Builder
+	for _, it := range items {
+		m, _ := it.(map[string]any)
+		if m == nil {
+			continue
+		}
+		if parsed {
+			fmt.Fprintf(&b, "%v\n%v\n%v\n%v\n", m["subject"], m["text"], m["html"], m["sender"])
+		} else {
+			fmt.Fprintf(&b, "%v\n%v\n%v\n%v\n%v\n", m["subject"], m["text"], m["html"], m["raw"], m["source"])
+		}
+	}
+	return b.String()
 }
 
 func (p *Provider) testmailFetch(h Handle) (string, error) {

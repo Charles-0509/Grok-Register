@@ -24,6 +24,7 @@ grok upload                # 手动上传 CPA JSON 到 Management API
 | **Turnstile 屏外有头** | 默认 `TURNSTILE_MODE=offscreen`（非真 headless，降低 600010） |
 | **Castle 空 token** | 当前 `castleRequestToken=""`；风控收紧后再补 offline |
 | **testmail** | `EMAIL_MODE=testmail`，GitHub Student Pack 等 |
+| **cf_temp_email** | 对接 [cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email) 自建 Worker |
 | **全局座位上限** | `done + reserved ≤ target` |
 | **CPA 上传 wait** | 结束前等待 Management 上传，避免进程先退出 |
 | **一键安装** | 路径/命令名/WARP/结束停容器交互；安全同步（不再误删非空目录） |
@@ -386,14 +387,25 @@ EMAIL_MODE=tempmail
 # TESTMAIL_NAMESPACE=你的_namespace
 # TESTMAIL_DOMAIN=inbox.testmail.app
 
-# 3) 自建域名
+# 3) 自建域名 webhook（Email Routing + 本地 webhook）
 # EMAIL_MODE=custom
 # EMAIL_DOMAIN=example.com
 # EMAIL_API=http://127.0.0.1:8080
+
+# 4) cloudflare_temp_email 自建 Worker
+#    https://github.com/dreamhunter2333/cloudflare_temp_email
+# EMAIL_MODE=cf_temp_email
+# CF_TEMP_EMAIL_API=https://mail-api.example.com
+# CF_TEMP_EMAIL_ADMIN=你的_admin_密码
+# CF_TEMP_EMAIL_DOMAIN=              # 可选；留空=Worker 已配置域名随机/默认
+# CF_TEMP_EMAIL_AUTH=                # 可选 x-custom-auth
+# CF_TEMP_EMAIL_PREFIX=1
 ```
 
 `tempmail` = tempmail.lol + mail.tm 系 fallback，**无需私人 Token**。  
-`testmail` 密钥只写本地 `config.env`，勿提交仓库。
+`testmail` 密钥只写本地 `config.env`，勿提交仓库。  
+`cf_temp_email` 对接 [cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)：用 **admin 建号** `POST /admin/new_address`（`x-admin-auth`）拿地址 JWT，再 `GET /api/parsed_mails` 收信抽验证码；旧部署无 `parsed_mails` 时自动回退 `/api/mails`。  
+**`CF_TEMP_EMAIL_DOMAIN` 可选**：不填则请求不带 domain，由 Worker 按自身 `DOMAINS`/`DEFAULT_DOMAINS` 随机或取默认；填了则固定该后缀。别名：`cf_temp` / `cftemp`。
 
 ### 7. 启动与运维
 
