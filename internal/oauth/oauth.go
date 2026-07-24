@@ -316,14 +316,42 @@ func isRedirect(code int) bool {
 	return code == 301 || code == 302 || code == 303 || code == 307 || code == 308
 }
 
+func absURL(baseHost, loc string) string {
+	if loc == "" {
+		return ""
+	}
+	if strings.HasPrefix(loc, "http://") || strings.HasPrefix(loc, "https://") {
+		return loc
+	}
+	if strings.HasPrefix(loc, "/") {
+		return baseHost + loc
+	}
+	return loc
+}
+
+func authorizedBody(body string) bool {
+	low := strings.ToLower(body)
+	return strings.Contains(low, "device authorized") ||
+		strings.Contains(body, "设备已授权") ||
+		strings.Contains(low, "you have authorized") ||
+		strings.Contains(low, "device is authorized")
+}
+
 // ConfirmHTTP posts verify + approve with SSO cookie (no browser).
-// Must not treat bare 2xx HTML as authorized — that causes token poll invalid_grant.
+// Success only when device is actually marked authorized (done path / body text).
+// Accepting arbitrary redirects was causing token poll invalid_grant (Access denied).
 func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) error {
 	sso = strings.TrimSpace(sso)
 	if sso == "" {
 		return fmt.Errorf("login_required")
 	}
 	cookie := "sso=" + sso
+
+	// Warm: open verification page so auth.x.ai sees cookie session (optional).
+	if flow.VerificationURL != "" {
+		_, _, _ = c.getWithCookie(ctx, flow.VerificationURL, cookie)
+	}
+
 	// verify
 	form := url.Values{"user_code": {flow.UserCode}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, VerifyURL, strings.NewReader(form.Encode()))
@@ -338,6 +366,8 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 	loc := resp.Header.Get("Location")
 	vbody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	_ = resp.Body.Close()
+	// Merge any Set-Cookie (session) into cookie jar string for subsequent posts.
+	cookie = mergeSetCookies(cookie, resp.Header)
 	if err := locationError(loc); err != nil {
 		if errors.Is(err, ErrRateLimited) {
 			c.TripRateLimit()
@@ -347,11 +377,10 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 	if resp.StatusCode == 403 {
 		return fmt.Errorf("challenge")
 	}
-	if isDeviceDone(loc) {
+	if isDeviceDone(loc) || authorizedBody(string(vbody)) {
 		c.ClearRateLimit()
 		return nil
 	}
-	// verify must redirect to consent (or done). Bare 200 without location = not confirmed.
 	if !isRedirect(resp.StatusCode) && loc == "" {
 		preview := strings.TrimSpace(string(vbody))
 		if len(preview) > 120 {
@@ -359,24 +388,36 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 		}
 		return fmt.Errorf("device_verify_failed status=%d body=%q", resp.StatusCode, preview)
 	}
-	// approve
-	consentRef := loc
+
+	consentRef := absURL("https://accounts.x.ai", loc)
 	if consentRef == "" {
 		consentRef = "https://accounts.x.ai/oauth2/device/consent?user_code=" + url.QueryEscape(flow.UserCode)
-	} else if strings.HasPrefix(consentRef, "/") {
-		consentRef = "https://accounts.x.ai" + consentRef
 	}
-	principal := principalFromSSO(sso)
-	// Prefer principal_id from consent HTML if JWT has no sub (common after platform changes).
-	if htmlPID := c.fetchConsentPrincipal(ctx, consentRef, cookie); htmlPID != "" {
-		principal = htmlPID
-	}
+
+	// Build approve form: defaults + hidden fields from consent HTML when available.
 	aform := url.Values{
 		"user_code":      {flow.UserCode},
 		"action":         {"allow"},
 		"principal_type": {"User"},
-		"principal_id":   {principal},
+		"principal_id":   {principalFromSSO(sso)},
 	}
+	if fields, htmlCookie := c.loadConsentForm(ctx, consentRef, cookie); len(fields) > 0 {
+		cookie = htmlCookie
+		for k, vs := range fields {
+			if len(vs) > 0 && vs[0] != "" {
+				aform.Set(k, vs[0])
+			}
+		}
+		// Force allow after merging (page may have deny button defaults).
+		aform.Set("action", "allow")
+		if aform.Get("user_code") == "" {
+			aform.Set("user_code", flow.UserCode)
+		}
+		if aform.Get("principal_type") == "" {
+			aform.Set("principal_type", "User")
+		}
+	}
+
 	req2, err := http.NewRequestWithContext(ctx, http.MethodPost, ApproveURL, strings.NewReader(aform.Encode()))
 	if err != nil {
 		return err
@@ -389,38 +430,165 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 	aloc := resp2.Header.Get("Location")
 	body, _ := io.ReadAll(io.LimitReader(resp2.Body, 1<<20))
 	_ = resp2.Body.Close()
+	cookie = mergeSetCookies(cookie, resp2.Header)
 	if err := locationError(aloc); err != nil {
 		if errors.Is(err, ErrRateLimited) {
 			c.TripRateLimit()
 		}
-		return err
+		return fmt.Errorf("device_approve: %w", err)
 	}
-	text := strings.ToLower(string(body))
-	if strings.Contains(text, "invalid action") {
-		return fmt.Errorf("consent_invalid_action")
-	}
-	if strings.Contains(text, "device authorized") || strings.Contains(string(body), "设备已授权") {
+	if authorizedBody(string(body)) || isDeviceDone(aloc) {
 		c.ClearRateLimit()
 		return nil
 	}
-	if isDeviceDone(aloc) {
-		c.ClearRateLimit()
-		return nil
-	}
-	// Non-error redirect after allow is usually success (token poll is truth).
-	if isRedirect(resp2.StatusCode) && aloc != "" && locationError(aloc) == nil {
-		c.ClearRateLimit()
-		return nil
+	// Follow approve redirect and require done / authorized markers (strict).
+	if isRedirect(resp2.StatusCode) && aloc != "" {
+		next := absURL("https://auth.x.ai", aloc)
+		if next == "" {
+			next = absURL("https://accounts.x.ai", aloc)
+		}
+		if isDeviceDone(next) {
+			c.ClearRateLimit()
+			return nil
+		}
+		if st, b, err := c.getWithCookie(ctx, next, cookie); err == nil {
+			if authorizedBody(b) || isDeviceDone(next) || (st >= 200 && st < 400 && strings.Contains(strings.ToLower(b), "authorized")) {
+				c.ClearRateLimit()
+				return nil
+			}
+			// If bounced to login / consent again → not authorized
+			if strings.Contains(next, "consent") || strings.Contains(strings.ToLower(b), "sign in") || strings.Contains(strings.ToLower(b), "log in") {
+				return fmt.Errorf("device_approve_not_authorized status=%d loc=%q", resp2.StatusCode, aloc)
+			}
+		}
+		// Strict: non-done redirect is NOT success (was root of invalid_grant Access denied).
+		return fmt.Errorf("device_approve_incomplete status=%d loc=%q", resp2.StatusCode, aloc)
 	}
 	if resp2.StatusCode == 403 {
 		return fmt.Errorf("challenge")
 	}
-	// Do NOT accept generic 2xx without authorized markers — was causing invalid_grant.
 	preview := strings.TrimSpace(string(body))
 	if len(preview) > 160 {
 		preview = preview[:160]
 	}
 	return fmt.Errorf("unknown_page status=%d loc=%q body=%q", resp2.StatusCode, aloc, preview)
+}
+
+func mergeSetCookies(cookie string, h http.Header) string {
+	// Keep existing; append new name=value from Set-Cookie (simple).
+	out := cookie
+	for _, sc := range h.Values("Set-Cookie") {
+		part := strings.SplitN(sc, ";", 2)[0]
+		if !strings.Contains(part, "=") {
+			continue
+		}
+		name := strings.SplitN(part, "=", 2)[0]
+		// replace existing name=
+		found := false
+		segs := strings.Split(out, "; ")
+		for i, s := range segs {
+			if strings.HasPrefix(s, name+"=") {
+				segs[i] = part
+				found = true
+			}
+		}
+		if found {
+			out = strings.Join(segs, "; ")
+		} else if out == "" {
+			out = part
+		} else {
+			out = out + "; " + part
+		}
+	}
+	return out
+}
+
+func (c *Client) getWithCookie(ctx context.Context, rawURL, cookie string) (int, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("User-Agent", c.ua)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Cookie", cookie)
+	if c.clear != nil {
+		if h := c.clear.CookieHeader(); h != "" {
+			req.Header.Set("Cookie", cookie+"; "+h)
+		}
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+	_ = resp.Body.Close()
+	return resp.StatusCode, string(body), nil
+}
+
+// loadConsentForm GETs consent page and extracts form fields (principal_id, csrf, etc.).
+func (c *Client) loadConsentForm(ctx context.Context, consentURL, cookie string) (url.Values, string) {
+	st, html, err := c.getWithCookie(ctx, consentURL, cookie)
+	if err != nil || st >= 400 {
+		return nil, cookie
+	}
+	fields := parseHTMLFormFields(html)
+	return fields, cookie
+}
+
+func parseHTMLFormFields(html string) url.Values {
+	out := url.Values{}
+	// input ... name="..." ... value="..." (order may vary)
+	lower := html
+	// naive scan for name= and value= pairs on input tags
+	for i := 0; i < len(html); {
+		idx := strings.Index(strings.ToLower(lower[i:]), "<input")
+		if idx < 0 {
+			break
+		}
+		i += idx
+		end := strings.Index(lower[i:], ">")
+		if end < 0 {
+			break
+		}
+		tag := html[i : i+end]
+		i += end + 1
+		name := attrValue(tag, "name")
+		if name == "" {
+			continue
+		}
+		val := attrValue(tag, "value")
+		out.Set(name, val)
+	}
+	return out
+}
+
+func attrValue(tag, attr string) string {
+	// attr="..." or attr='...'
+	low := strings.ToLower(tag)
+	key := strings.ToLower(attr) + "="
+	j := strings.Index(low, key)
+	if j < 0 {
+		return ""
+	}
+	rest := tag[j+len(key):]
+	if rest == "" {
+		return ""
+	}
+	q := rest[0]
+	if q == '"' || q == '\'' {
+		rest = rest[1:]
+		k := strings.IndexByte(rest, q)
+		if k < 0 {
+			return ""
+		}
+		return rest[:k]
+	}
+	// unquoted
+	k := strings.IndexAny(rest, " \t>/")
+	if k < 0 {
+		return rest
+	}
+	return rest[:k]
 }
 
 func locationError(loc string) error {
@@ -454,45 +622,6 @@ func (c *Client) setFormHeaders(req *http.Request, referer, cookie string) {
 			req.Header.Set("Cookie", cookie+"; "+h)
 		}
 	}
-}
-
-// fetchConsentPrincipal GETs consent page and parses hidden principal_id if present.
-func (c *Client) fetchConsentPrincipal(ctx context.Context, consentURL, cookie string) string {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, consentURL, nil)
-	if err != nil {
-		return ""
-	}
-	req.Header.Set("User-Agent", c.ua)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Cookie", cookie)
-	if c.clear != nil {
-		if h := c.clear.CookieHeader(); h != "" {
-			req.Header.Set("Cookie", cookie+"; "+h)
-		}
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return ""
-	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
-	_ = resp.Body.Close()
-	html := string(body)
-	// name="principal_id" value="..."
-	for _, pat := range []string{
-		`name="principal_id" value="`,
-		`name='principal_id' value='`,
-		`name="principal_id" value='`,
-		`"principal_id":"`,
-	} {
-		if i := strings.Index(html, pat); i >= 0 {
-			rest := html[i+len(pat):]
-			end := strings.IndexAny(rest, `"'`)
-			if end > 0 {
-				return rest[:end]
-			}
-		}
-	}
-	return ""
 }
 
 func (c *Client) PollToken(ctx context.Context, flow DeviceFlow) (Credential, error) {
