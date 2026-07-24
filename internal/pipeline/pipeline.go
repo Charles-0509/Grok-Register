@@ -225,11 +225,17 @@ func (e *Engine) run(ctx context.Context) error {
 		log.Infof("[clearance] %s", msg)
 		e.cm = clearance.NewManager(cfg.FlareSolverrURL, cfg.ClearanceProxy, cfg.ClearanceURLs)
 		if msg2, err2 := e.cm.Prewarm(); err2 != nil {
-			log.Warnf("[clearance] 预热: %v (%s)", err2, msg2)
+			// Critical: accounts/auth ERR often correlates with OAuth invalid_grant later.
+			log.Warnf("[clearance] 预热异常: %v | %s", err2, msg2)
+			log.Warn("[clearance] 若 accounts.x.ai/auth.x.ai 为 ERR，OAuth 很可能全部 invalid_grant")
 		} else {
 			log.Infof("[clearance] %s", msg2)
 		}
 	}
+
+	// If config points REGISTER_PROXY at local Privoxy (40080) but stack is down,
+	// start it FIRST — otherwise warm spams chrome_124/120 with connection refused.
+	proxyNeedsStack := clearance.LocalClearanceProxyDown(cfg.RegisterProxy, 40080)
 
 	switch clearMode {
 	case "always":
@@ -237,8 +243,15 @@ func (e *Engine) run(ctx context.Context) error {
 		ensureClearance("always")
 	case "never":
 		log.Info("[clearance] CLEARANCE_MODE=never（协议 TLS 直连/代理，无 Docker 清障）")
+		if proxyNeedsStack {
+			log.Warn("[clearance] REGISTER_PROXY 指向 :40080 但清障未运行，且 MODE=never — 请改代理或改为 auto/always")
+		}
 	default:
 		log.Info("[clearance] CLEARANCE_MODE=auto（协议优先，CF 拦截时再拉清障）")
+		if proxyNeedsStack && cfg.ClearanceEnabled {
+			log.Info("[clearance] 检测到 REGISTER_PROXY→:40080 未监听，先起清障再 warm")
+			ensureClearance("proxy_down")
+		}
 	}
 	if cfg.ClearanceAutoStop && clearMode != "never" {
 		log.Info("[clearance] CLEARANCE_AUTO_STOP=1：本 run 若拉起栈，结束时将 stop")
@@ -319,39 +332,68 @@ func (e *Engine) run(ctx context.Context) error {
 	log.Info("Fetching signup config (protocol warm)…")
 	scfg, err := e.xai.FetchConfig()
 	if err != nil {
-		// Protocol-first: CF block → try profile fallbacks, then clearance auto
 		code := protocol.CodeOf(err)
+		errStr := err.Error()
+		proxyDead := strings.Contains(errStr, "connection refused") ||
+			strings.Contains(errStr, "40080") ||
+			strings.Contains(errStr, "connect: connection refused")
 		log.Warnf("[cf] warm failed code=%s err=%v", code, err)
-		tried := map[string]struct{}{e.xai.Profile(): {}}
-		for _, fb := range protocol.FallbackProfiles(cfg.CFImpersonateFallback) {
-			if _, ok := tried[fb]; ok {
-				continue
-			}
-			tried[fb] = struct{}{}
-			log.Infof("[cf] try impersonate fallback=%s", fb)
-			if rerr := e.xai.RecreateWithProfile(fb); rerr != nil {
-				log.Warnf("[cf] recreate %s: %v", fb, rerr)
-				continue
-			}
-			scfg, err = e.xai.FetchConfig()
-			if err == nil {
-				log.Infof("[cf] warm ok profile=%s", e.xai.Profile())
-				break
-			}
-			log.Warnf("[cf] fallback %s failed: %v", fb, err)
-		}
-		if err != nil && clearMode == "auto" {
-			ensureClearance("cf_blocked")
-			// rebuild client with clearance cookies
+
+		// Proxy dead → start clearance immediately, skip fingerprint spam.
+		if proxyDead && clearMode == "auto" && cfg.ClearanceEnabled {
+			log.Warn("[cf] 代理不可达 (connection refused)，跳过 impersonate 回退，直接拉清障")
+			ensureClearance("proxy_refused")
 			e.xai, err = protocol.NewClientOpts(protocol.ClientOptions{
 				Proxy:       cfg.RegisterProxy,
 				Clearance:   e.cm,
-				Impersonate: e.xai.Profile(),
+				Impersonate: imp,
 			})
 			if err != nil {
 				return err
 			}
 			scfg, err = e.xai.FetchConfig()
+		} else {
+			// Protocol-first: CF block → try profile fallbacks, then clearance auto
+			tried := map[string]struct{}{e.xai.Profile(): {}}
+			for _, fb := range protocol.FallbackProfiles(cfg.CFImpersonateFallback) {
+				if _, ok := tried[fb]; ok {
+					continue
+				}
+				tried[fb] = struct{}{}
+				log.Infof("[cf] try impersonate fallback=%s", fb)
+				if rerr := e.xai.RecreateWithProfile(fb); rerr != nil {
+					log.Warnf("[cf] recreate %s: %v", fb, rerr)
+					continue
+				}
+				scfg, err = e.xai.FetchConfig()
+				if err == nil {
+					log.Infof("[cf] warm ok profile=%s", e.xai.Profile())
+					break
+				}
+				log.Warnf("[cf] fallback %s failed: %v", fb, err)
+				if strings.Contains(err.Error(), "connection refused") {
+					log.Warn("[cf] 仍是 connection refused，停止 fallback")
+					break
+				}
+			}
+			if err != nil && clearMode == "auto" {
+				ensureClearance("cf_blocked")
+				e.xai, err = protocol.NewClientOpts(protocol.ClientOptions{
+					Proxy:       cfg.RegisterProxy,
+					Clearance:   e.cm,
+					Impersonate: e.xai.Profile(),
+				})
+				if err != nil {
+					return err
+				}
+				scfg, err = e.xai.FetchConfig()
+			}
+		}
+	}
+	// Rebuild oauth client after clearance manager may have been attached.
+	if e.cm != nil {
+		if oc, oerr := oauth.NewClient(cfg.RegisterProxy, e.cm, time.Duration(cfg.OAuthRetrySec)*time.Second); oerr == nil {
+			e.oauth = oc
 		}
 	}
 	if err != nil {

@@ -89,14 +89,14 @@ type fsRequest struct {
 }
 
 type fsResponse struct {
-	Status  string `json:"status"`
-	Message string `json:"message"`
+	Status   string `json:"status"`
+	Message  string `json:"message"`
 	Solution *struct {
-		URL       string              `json:"url"`
-		Status    int                 `json:"status"`
-		Cookies   []map[string]any    `json:"cookies"`
-		UserAgent string              `json:"userAgent"`
-		Response  string              `json:"response"`
+		URL       string           `json:"url"`
+		Status    int              `json:"status"`
+		Cookies   []map[string]any `json:"cookies"`
+		UserAgent string           `json:"userAgent"`
+		Response  string           `json:"response"`
 	} `json:"solution"`
 }
 
@@ -106,17 +106,33 @@ func (m *Manager) Prewarm() (string, error) {
 	var parts []string
 	var allCookies []Cookie
 	ua := ""
+	accountsOK := false
+	authOK := false
 
-	for _, u := range m.URLs {
+	// Prefer accounts.x.ai first (signup + OAuth cookie domain).
+	urls := prioritizeURLs(m.URLs)
+
+	for _, u := range urls {
 		start := time.Now()
 		cookies, userAgent, status, err := m.solveOne(client, u)
+		// One retry for critical hosts
+		if err != nil && isCriticalHost(u) {
+			cookies, userAgent, status, err = m.solveOne(client, u)
+		}
 		elapsed := time.Since(start).Seconds()
+		h := hostOf(u)
 		if err != nil {
 			failN++
-			parts = append(parts, fmt.Sprintf("%s:ERR", hostOf(u)))
+			parts = append(parts, fmt.Sprintf("%s:ERR", h))
 			continue
 		}
 		okN++
+		if strings.Contains(h, "accounts.x.ai") {
+			accountsOK = true
+		}
+		if strings.Contains(h, "auth.x.ai") {
+			authOK = true
+		}
 		cf := "cf-"
 		for _, c := range cookies {
 			if c.Name == "cf_clearance" {
@@ -124,7 +140,7 @@ func (m *Manager) Prewarm() (string, error) {
 				break
 			}
 		}
-		parts = append(parts, fmt.Sprintf("%s:%.1fs/%s", hostOf(u), elapsed, cf))
+		parts = append(parts, fmt.Sprintf("%s:%.1fs/%s", h, elapsed, cf))
 		allCookies = mergeCookies(allCookies, cookies)
 		if userAgent != "" {
 			ua = userAgent
@@ -140,7 +156,52 @@ func (m *Manager) Prewarm() (string, error) {
 	if okN == 0 {
 		return msg, fmt.Errorf("clearance prewarm failed all hosts")
 	}
+	if !accountsOK {
+		// Soft error: still return msg but error so caller can warn loudly.
+		return msg, fmt.Errorf("accounts.x.ai 预热失败（OAuth/注册 cookie 可能无效）")
+	}
+	if !authOK {
+		return msg, fmt.Errorf("auth.x.ai 预热失败（device OAuth 可能失败）")
+	}
 	return msg, nil
+}
+
+func isCriticalHost(u string) bool {
+	h := hostOf(u)
+	return strings.Contains(h, "accounts.x.ai") || strings.Contains(h, "auth.x.ai")
+}
+
+func prioritizeURLs(urls []string) []string {
+	var crit, rest []string
+	seen := map[string]struct{}{}
+	for _, u := range urls {
+		if _, ok := seen[u]; ok {
+			continue
+		}
+		seen[u] = struct{}{}
+		if isCriticalHost(u) {
+			crit = append(crit, u)
+		} else {
+			rest = append(rest, u)
+		}
+	}
+	// Ensure defaults present if empty list pieces
+	out := append(crit, rest...)
+	if len(out) == 0 {
+		return []string{"https://accounts.x.ai", "https://auth.x.ai", "https://x.ai"}
+	}
+	// If accounts missing from config, prepend it
+	hasAcc := false
+	for _, u := range out {
+		if strings.Contains(hostOf(u), "accounts.x.ai") {
+			hasAcc = true
+			break
+		}
+	}
+	if !hasAcc {
+		out = append([]string{"https://accounts.x.ai"}, out...)
+	}
+	return out
 }
 
 func (m *Manager) solveOne(client *http.Client, target string) ([]Cookie, string, int, error) {

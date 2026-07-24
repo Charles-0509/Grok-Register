@@ -113,6 +113,25 @@ func runCompose(dir string, args ...string) (string, error) {
 	return out, nil
 }
 
+// LocalClearanceProxyDown is true when REGISTER_PROXY points at local privoxy
+// (typically 127.0.0.1:40080) but that port is not accepting connections.
+func LocalClearanceProxyDown(registerProxy string, privoxyPort int) bool {
+	if privoxyPort <= 0 {
+		privoxyPort = 40080
+	}
+	p := strings.TrimSpace(strings.ToLower(registerProxy))
+	if p == "" {
+		return false
+	}
+	// Only care about local clearance chain ports
+	local := strings.Contains(p, "127.0.0.1") || strings.Contains(p, "localhost")
+	portMatch := strings.Contains(p, fmt.Sprintf(":%d", privoxyPort))
+	if !local || !portMatch {
+		return false
+	}
+	return !portOpen("127.0.0.1", privoxyPort)
+}
+
 // StackRunning reports whether all clearance containers appear running.
 func StackRunning() bool {
 	for _, name := range stackContainerNames {
