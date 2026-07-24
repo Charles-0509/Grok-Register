@@ -829,6 +829,59 @@ func trimLoc(s string) string {
 	return s[:120] + "…"
 }
 
+// Refresh exchanges a refresh_token for a new access/refresh pair (no device confirm).
+func (c *Client) Refresh(ctx context.Context, refreshToken string) (Credential, error) {
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return Credential{}, fmt.Errorf("refresh_token empty")
+	}
+	if err := c.WaitRateLimit(ctx); err != nil {
+		return Credential{}, err
+	}
+	_, tokenEP, err := c.discover(ctx)
+	if err != nil {
+		return Credential{}, err
+	}
+	form := url.Values{}
+	form.Set("client_id", ClientID)
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refreshToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEP, strings.NewReader(form.Encode()))
+	if err != nil {
+		return Credential{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", c.ua)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return Credential{}, err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	_ = resp.Body.Close()
+	var doc map[string]any
+	_ = json.Unmarshal(body, &doc)
+	if resp.StatusCode/100 == 2 {
+		cred, err := credentialFrom(doc, tokenEP)
+		if err != nil {
+			return Credential{}, err
+		}
+		// Some IdPs omit rotating refresh_token; keep old.
+		if cred.RefreshToken == "" {
+			cred.RefreshToken = refreshToken
+		}
+		return cred, nil
+	}
+	errCode, _ := doc["error"].(string)
+	errDesc, _ := doc["error_description"].(string)
+	if errCode == "" {
+		return Credential{}, fmt.Errorf("refresh_rejected status=%d body=%s", resp.StatusCode, truncateBody(body, 120))
+	}
+	if errDesc != "" {
+		return Credential{}, fmt.Errorf("refresh_rejected: %s (%s)", errCode, errDesc)
+	}
+	return Credential{}, fmt.Errorf("refresh_rejected: %s", errCode)
+}
+
 // Exchange is convenience: start flow + confirm HTTP + poll.
 // On rate_limited / device 429 / invalid_grant, retry with a fresh device code.
 func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
