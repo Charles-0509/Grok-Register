@@ -241,9 +241,56 @@ func (c *Client) discover(ctx context.Context) (deviceEP, tokenEP string, err er
 	return deviceEP, tokenEP, nil
 }
 
+// seedSSO puts the session SSO into the jar for auth/accounts hosts and
+// returns the Cookie header value used for device confirm.
+func (c *Client) seedSSO(sso string) string {
+	sso = strings.TrimSpace(sso)
+	if sso == "" {
+		return ""
+	}
+	ck := &http.Cookie{Name: "sso", Value: sso, Path: "/", Secure: true, HttpOnly: true}
+	if c.http.Jar != nil {
+		for _, raw := range []string{
+			"https://auth.x.ai/",
+			"https://accounts.x.ai/",
+			"https://x.ai/",
+		} {
+			if u, err := url.Parse(raw); err == nil {
+				c.http.Jar.SetCookies(u, []*http.Cookie{ck})
+			}
+		}
+	}
+	return "sso=" + sso
+}
+
+// warmDevicePage GETs the verification URL so the server associates the SSO
+// session with the user_code before verify/approve POSTs.
+func (c *Client) warmDevicePage(ctx context.Context, cookie string, flow DeviceFlow) {
+	vurl := strings.TrimSpace(flow.VerificationURL)
+	if vurl == "" {
+		vurl = "https://accounts.x.ai/sign-in/device?user_code=" + url.QueryEscape(flow.UserCode)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, vurl, nil)
+	if err != nil {
+		return
+	}
+	c.setNavHeaders(req, "https://accounts.x.ai/", cookie)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	_ = resp.Body.Close()
+}
+
 // ConfirmHTTP posts verify + approve with SSO cookie (no browser).
 func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) error {
-	cookie := "sso=" + sso
+	if strings.TrimSpace(sso) == "" {
+		return fmt.Errorf("oauth_sso_empty")
+	}
+	cookie := c.seedSSO(sso)
+	c.warmDevicePage(ctx, cookie, flow)
+
 	// verify
 	form := url.Values{"user_code": {flow.UserCode}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, VerifyURL, strings.NewReader(form.Encode()))
@@ -255,27 +302,37 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 	if err != nil {
 		return err
 	}
-	loc := resp.Header.Get("Location")
-	_, _ = io.Copy(io.Discard, resp.Body)
+	vbody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	_ = resp.Body.Close()
+	loc := resp.Header.Get("Location")
 	if err := locationError(loc); err != nil {
 		if err.Error() == "rate_limited" {
 			c.TripRateLimit()
 		}
-		return err
+		return fmt.Errorf("oauth_verify: %w", err)
 	}
 	if resp.StatusCode == 403 {
-		return fmt.Errorf("challenge")
+		return fmt.Errorf("oauth_verify: challenge")
 	}
-	if strings.Contains(loc, "/oauth2/device/done") {
+	if looksLikeLogin(string(vbody), loc) {
+		return fmt.Errorf("oauth_verify: sso_rejected (login redirect) status=%d", resp.StatusCode)
+	}
+	if deviceAuthorized(string(vbody), loc) {
+		c.ClearRateLimit()
 		return nil
 	}
+
 	// approve
 	consentRef := loc
 	if consentRef == "" {
 		consentRef = "https://accounts.x.ai/oauth2/device/consent?user_code=" + url.QueryEscape(flow.UserCode)
 	} else if strings.HasPrefix(consentRef, "/") {
-		consentRef = "https://accounts.x.ai" + consentRef
+		// Prefer accounts host for relative consent paths from verify.
+		if strings.Contains(consentRef, "auth.x.ai") {
+			consentRef = "https://auth.x.ai" + consentRef
+		} else {
+			consentRef = "https://accounts.x.ai" + consentRef
+		}
 	}
 	aform := url.Values{
 		"user_code":      {flow.UserCode},
@@ -299,21 +356,67 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 		if err.Error() == "rate_limited" {
 			c.TripRateLimit()
 		}
-		return err
+		return fmt.Errorf("oauth_approve: %w", err)
 	}
-	text := strings.ToLower(string(body))
-	if strings.Contains(text, "device authorized") || strings.Contains(string(body), "设备已授权") {
-		c.ClearRateLimit()
-		return nil
-	}
-	if resp2.StatusCode/100 == 2 || strings.Contains(aloc, "device/done") || (aloc != "" && locationError(aloc) == nil) {
+	text := string(body)
+	if deviceAuthorized(text, aloc) {
 		c.ClearRateLimit()
 		return nil
 	}
 	if resp2.StatusCode == 403 {
-		return fmt.Errorf("challenge")
+		return fmt.Errorf("oauth_approve: challenge")
 	}
-	return fmt.Errorf("unknown_page status=%d", resp2.StatusCode)
+	if looksLikeLogin(text, aloc) {
+		return fmt.Errorf("oauth_approve: sso_rejected (not logged in) status=%d", resp2.StatusCode)
+	}
+	// Do NOT treat bare 2xx / any redirect as success — that caused false
+	// positives and later invalid_grant "device not authorized" on token poll.
+	return fmt.Errorf("oauth_approve: not_authorized status=%d loc=%s body=%q",
+		resp2.StatusCode, truncateStr(aloc, 120), truncateStr(text, 160))
+}
+
+func deviceAuthorized(body, loc string) bool {
+	low := strings.ToLower(body)
+	if strings.Contains(low, "device authorized") || strings.Contains(body, "设备已授权") {
+		return true
+	}
+	if strings.Contains(loc, "/oauth2/device/done") || strings.Contains(loc, "device/done") {
+		return true
+	}
+	// success-ish query flags seen on some builds
+	if strings.Contains(loc, "authorized=true") || strings.Contains(loc, "status=authorized") {
+		return true
+	}
+	return false
+}
+
+func looksLikeLogin(body, loc string) bool {
+	lowLoc := strings.ToLower(loc)
+	// Device verify/consent pages are expected; not a session failure.
+	if strings.Contains(lowLoc, "sign-in/device") ||
+		strings.Contains(lowLoc, "/oauth2/device/") ||
+		strings.Contains(lowLoc, "device/consent") ||
+		strings.Contains(lowLoc, "device/verify") ||
+		strings.Contains(lowLoc, "device/approve") ||
+		strings.Contains(lowLoc, "device/done") {
+		return false
+	}
+	low := strings.ToLower(body + " " + loc)
+	// Hard unauthenticated redirects / pages.
+	for _, p := range []string{
+		"/sign-in?", "/sign-in\"", "accounts.x.ai/sign-in",
+		"auth.x.ai/u/login", "/u/login", `"sign in"`,
+		"name=\"password\"", "type=\"password\"",
+	} {
+		if strings.Contains(low, p) {
+			return true
+		}
+	}
+	// Bare /sign-in or /login location without device path.
+	if strings.Contains(lowLoc, "/sign-in") || strings.Contains(lowLoc, "/login") {
+		return true
+	}
+	return false
 }
 
 func locationError(loc string) error {
@@ -328,6 +431,10 @@ func locationError(loc string) error {
 	if e == "" {
 		return nil
 	}
+	desc := u.Query().Get("error_description")
+	if desc != "" {
+		return fmt.Errorf("%s (%s)", e, desc)
+	}
 	return fmt.Errorf("%s", e)
 }
 
@@ -335,13 +442,37 @@ func (c *Client) setFormHeaders(req *http.Request, referer, cookie string) {
 	req.Header.Set("User-Agent", c.ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Origin", "https://accounts.x.ai")
+	// Device verify/approve live on auth.x.ai; prefer matching Origin when posting there.
+	origin := "https://accounts.x.ai"
+	if req.URL != nil && strings.Contains(req.URL.Host, "auth.x.ai") {
+		origin = "https://auth.x.ai"
+	}
+	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", referer)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Cookie", cookie)
 	if c.clear != nil {
 		if h := c.clear.CookieHeader(); h != "" {
 			req.Header.Set("Cookie", cookie+"; "+h)
+		}
+	}
+}
+
+func (c *Client) setNavHeaders(req *http.Request, referer, cookie string) {
+	req.Header.Set("User-Agent", c.ua)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Referer", referer)
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "same-site")
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+		if c.clear != nil {
+			if h := c.clear.CookieHeader(); h != "" {
+				req.Header.Set("Cookie", cookie+"; "+h)
+			}
 		}
 	}
 }
@@ -378,20 +509,28 @@ func (c *Client) PollToken(ctx context.Context, flow DeviceFlow) (Credential, er
 			return credentialFrom(doc, flow.TokenEndpoint)
 		}
 		errCode, _ := doc["error"].(string)
+		errDesc, _ := doc["error_description"].(string)
 		switch errCode {
 		case "authorization_pending":
 			// continue
 		case "slow_down":
 			interval += time.Second
 		case "access_denied":
-			return Credential{}, fmt.Errorf("oauth_denied")
+			return Credential{}, fmt.Errorf("oauth_denied: %s", firstNonEmpty(errDesc, "access_denied"))
 		case "expired_token":
 			return Credential{}, fmt.Errorf("oauth_expired")
+		case "invalid_grant":
+			// Typical when ConfirmHTTP false-succeeded or SSO was rejected silently.
+			return Credential{}, fmt.Errorf("oauth_rejected: invalid_grant (%s) — device not authorized on auth.x.ai",
+				firstNonEmpty(errDesc, "Access denied"))
 		default:
 			if errCode != "" {
+				if errDesc != "" {
+					return Credential{}, fmt.Errorf("oauth_rejected: %s (%s)", errCode, errDesc)
+				}
 				return Credential{}, fmt.Errorf("oauth_rejected: %s", errCode)
 			}
-			return Credential{}, fmt.Errorf("oauth_rejected status=%d", resp.StatusCode)
+			return Credential{}, fmt.Errorf("oauth_rejected status=%d body=%q", resp.StatusCode, truncateStr(string(body), 160))
 		}
 		select {
 		case <-ctx.Done():
@@ -400,6 +539,24 @@ func (c *Client) PollToken(ctx context.Context, flow DeviceFlow) (Credential, er
 		}
 	}
 	return Credential{}, fmt.Errorf("oauth_expired")
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func truncateStr(s string, n int) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 func credentialFrom(doc map[string]any, endpoint string) (Credential, error) {
@@ -469,15 +626,28 @@ func jwtClaim(token, key string) string {
 
 // Exchange is convenience: start flow + confirm HTTP + poll.
 func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
+	start := time.Now()
 	if err := c.WaitRateLimit(ctx); err != nil {
 		return Credential{}, err
 	}
 	flow, err := c.StartDeviceFlow(ctx)
 	if err != nil {
-		return Credential{}, err
+		return Credential{}, fmt.Errorf("%w (%.1fs) sso=%s", err, time.Since(start).Seconds(), shortSSO(sso))
 	}
 	if err := c.ConfirmHTTP(ctx, sso, flow); err != nil {
-		return Credential{}, err
+		return Credential{}, fmt.Errorf("%w (%.1fs) sso=%s", err, time.Since(start).Seconds(), shortSSO(sso))
 	}
-	return c.PollToken(ctx, flow)
+	cred, err := c.PollToken(ctx, flow)
+	if err != nil {
+		return Credential{}, fmt.Errorf("%w (%.1fs) sso=%s", err, time.Since(start).Seconds(), shortSSO(sso))
+	}
+	return cred, nil
+}
+
+func shortSSO(sso string) string {
+	sso = strings.TrimSpace(sso)
+	if len(sso) <= 24 {
+		return sso
+	}
+	return sso[:12] + "…" + sso[len(sso)-8:]
 }
