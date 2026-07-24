@@ -113,7 +113,7 @@ func printHelp() {
   logs 等级:      默认 --info（隐藏 DBG）；--debug 显示全部；--warn / --error 更严
                   例: grok logs -f --debug
   默认节奏:       OAUTH_MIN_INTERVAL_SEC=6  PROBE_WARMUP_SEC=5  OAUTH_RETRY_SEC=60
-  reoauth:        优先 refresh_token；否则用本地 SSO 走 device；见 grok reoauth -h
+  reoauth:        优先 refresh_token；否则 SSO device；配置了 CPA 上传则自动入库
   升级后请查看 ~/.grok/config.env.example 了解新增配置项
 
 数据目录: ~/.grok/ (可用 GROK_HOME 覆盖)
@@ -725,6 +725,7 @@ func cmdReoauth(args []string) error {
   1) 有 refresh_token → OAuth refresh_token 换新 token（无需邮箱验证码）
   2) 否则有 sso → device OAuth（与注册机相同）
   3) inspection 仅 email 时，自动在 ~/.grok/outputs 里按 email 查找历史 CPA/SSO
+  4) 若 config 启用了 CPA 上传（CPA_UPLOAD_ENABLED + KEY），成功后自动入库 Management API
 
 选项:
   --thread N / -j N   并发 (1-8，默认 2)
@@ -732,6 +733,8 @@ func cmdReoauth(args []string) error {
   --no-lookup         不扫描本地 outputs 补全凭证
   --no-probe          写出前不做 cli-chat-proxy 探活
   --interval SEC      两次请求最小间隔（默认 2）
+  --upload            强制上传（即使 CPA_UPLOAD_ENABLED=0，仍需 KEY）
+  --no-upload         禁止上传（覆盖 config）
 
 示例:
   grok reoauth ./grok-inspection-quota_exhausted-....json
@@ -747,6 +750,8 @@ func cmdReoauth(args []string) error {
 	lookup := true
 	probe := true
 	intervalSec := 2.0
+	uploadForce := false
+	uploadOff := false
 
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -779,6 +784,10 @@ func cmdReoauth(args []string) error {
 			lookup = false
 		case a == "--no-probe":
 			probe = false
+		case a == "--upload":
+			uploadForce = true
+		case a == "--no-upload":
+			uploadOff = true
 		case a == "--interval":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--interval 需要秒数")
@@ -861,6 +870,41 @@ func cmdReoauth(args []string) error {
 		lookupRoots = []string{p.Outputs}
 	}
 
+	// CPA Management upload: same config as register pipeline.
+	uploadEnabled := cfg.CPAUploadEnabled
+	if uploadForce {
+		uploadEnabled = true
+	}
+	if uploadOff {
+		uploadEnabled = false
+	}
+	var uploader *cpa.Uploader
+	if uploadEnabled {
+		if strings.TrimSpace(cfg.CPAManagementKey) == "" {
+			fmt.Println("[!] CPA 上传已启用但未配置 CPA_MANAGEMENT_KEY，跳过入库")
+		} else {
+			base := cfg.CPAManagementBase
+			if strings.TrimSpace(base) == "" {
+				base = "http://127.0.0.1:8317/v0/management"
+			}
+			uploader = cpa.NewUploader(cpa.UploadConfig{
+				Enabled:      true,
+				BaseURL:      base,
+				Key:          cfg.CPAManagementKey,
+				TimeoutSec:   cfg.CPAUploadTimeoutSec,
+				Retries:      cfg.CPAUploadRetries,
+				NameTemplate: cfg.CPAUploadNameTemplate,
+				Verify:       cfg.CPAUploadVerify,
+				Mode:         cfg.CPAUploadMode,
+			}, func(f string, a ...any) {
+				fmt.Printf("[cpa] "+f+"\n", a...)
+			})
+			if uploader.Enabled() {
+				fmt.Printf("[*] CPA 自动入库: %s\n", cpa.NormalizeManagementBase(base))
+			}
+		}
+	}
+
 	ctx := context.Background()
 	_, err = reoauth.Run(ctx, accs, reoauth.Options{
 		Proxy:       proxy,
@@ -871,6 +915,7 @@ func cmdReoauth(args []string) error {
 		ProbeWarmup: cfg.ProbeWarmupSec,
 		LookupRoots: lookupRoots,
 		Secret:      cpa.DefaultSecret(),
+		Uploader:    uploader,
 		OutLog: func(f string, a ...any) {
 			fmt.Printf(f+"\n", a...)
 		},

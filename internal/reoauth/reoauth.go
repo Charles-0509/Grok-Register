@@ -32,11 +32,13 @@ type Account struct {
 
 // Result is one account outcome.
 type Result struct {
-	Email  string
-	OK     bool
-	Method string // refresh | device | skip
-	Path   string // written CPA path
-	Err    string
+	Email    string
+	OK       bool
+	Method   string // refresh | device | skip
+	Path     string // written CPA path
+	Uploaded bool
+	Upload   string // upload error or name
+	Err      string
 }
 
 // Options for Run.
@@ -50,6 +52,8 @@ type Options struct {
 	ProbeWarmup float64
 	LookupRoots []string // optional ~/.grok/outputs etc. to resolve email→token
 	Secret      []byte
+	// Uploader: when non-nil and Enabled(), successful CPA files are pushed to Management API.
+	Uploader *cpa.Uploader
 }
 
 func logf(opt Options, f string, a ...any) {
@@ -458,7 +462,7 @@ func Run(ctx context.Context, accs []Account, opt Options) ([]Result, error) {
 	var wg sync.WaitGroup
 	var gateMu sync.Mutex
 	var nextAt time.Time
-	var okN, failN, skipN atomic.Int64
+	var okN, failN, skipN, upOK, upFail atomic.Int64
 
 	worker := func() {
 		defer wg.Done()
@@ -496,7 +500,17 @@ func Run(ctx context.Context, accs []Account, opt Options) ([]Result, error) {
 			results[j.i] = res
 			if res.OK {
 				okN.Add(1)
-				logf(opt, "✓ %s method=%s → %s", res.Email, res.Method, filepath.Base(res.Path))
+				msg := fmt.Sprintf("✓ %s method=%s → %s", res.Email, res.Method, filepath.Base(res.Path))
+				if opt.Uploader != nil && opt.Uploader.Enabled() {
+					if res.Uploaded {
+						upOK.Add(1)
+						msg += " 上传OK"
+					} else if res.Upload != "" {
+						upFail.Add(1)
+						msg += " 上传失败:" + res.Upload
+					}
+				}
+				logf(opt, "%s", msg)
 			} else if res.Method == "skip" {
 				skipN.Add(1)
 				logf(opt, "– skip %s: %s", res.Email, res.Err)
@@ -524,7 +538,12 @@ func Run(ctx context.Context, accs []Account, opt Options) ([]Result, error) {
 	close(jobs)
 	wg.Wait()
 
-	logf(opt, "完成 ok=%d fail=%d skip=%d total=%d out=%s", okN.Load(), failN.Load(), skipN.Load(), len(accs), opt.OutCPA)
+	if opt.Uploader != nil && opt.Uploader.Enabled() {
+		logf(opt, "完成 ok=%d fail=%d skip=%d upload_ok=%d upload_fail=%d total=%d out=%s",
+			okN.Load(), failN.Load(), skipN.Load(), upOK.Load(), upFail.Load(), len(accs), opt.OutCPA)
+	} else {
+		logf(opt, "完成 ok=%d fail=%d skip=%d total=%d out=%s", okN.Load(), failN.Load(), skipN.Load(), len(accs), opt.OutCPA)
+	}
 	return results, nil
 }
 
@@ -588,5 +607,27 @@ func reauthOne(ctx context.Context, cli *oauth.Client, a Account, opt Options) R
 	}
 	res.OK = true
 	res.Path = path
+
+	if opt.Uploader != nil && opt.Uploader.Enabled() {
+		ur := opt.Uploader.UploadDocument(doc)
+		if ur.OK {
+			res.Uploaded = true
+			res.Upload = ur.Name
+		} else {
+			if ur.Err != nil {
+				res.Upload = ur.Err.Error()
+			} else {
+				res.Upload = fmt.Sprintf("http=%d %s", ur.Status, truncate(ur.Body, 80))
+			}
+		}
+	}
 	return res
+}
+
+func truncate(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
