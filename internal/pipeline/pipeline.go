@@ -803,9 +803,14 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 		})
 		log.Startf("OAuth %s", job.Email)
 		t0 := time.Now()
+		// SSO preview for debugging (prefix only)
+		ssoPrev := job.SSO
+		if len(ssoPrev) > 24 {
+			ssoPrev = ssoPrev[:12] + "…" + ssoPrev[len(ssoPrev)-8:]
+		}
 		cred, err := e.oauth.Exchange(ctx, job.SSO)
 		if err != nil {
-			log.Warnf("OAuth fail %s: %v (%.1fs)", job.Email, err, time.Since(t0).Seconds())
+			log.Warnf("OAuth fail %s: %v (%.1fs) sso=%s", job.Email, err, time.Since(t0).Seconds(), ssoPrev)
 			e.fail.Add(1)
 			e.releaseReserve()
 			continue

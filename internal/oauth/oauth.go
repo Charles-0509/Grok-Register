@@ -419,6 +419,8 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 	if isSignInRedirect(consentRef) {
 		return fmt.Errorf("sso_rejected verify→%s", consentRef)
 	}
+	// Diagnostic context for operators (short).
+	_ = fmt.Sprintf("verify status=%d loc=%s", resp.StatusCode, trimLoc(loc))
 
 	// Minimal form matching historical working Python client (empty principal_id OK).
 	// Then overlay non-empty fields from consent HTML (csrf / principal_id).
@@ -567,12 +569,10 @@ func (c *Client) getWithCookie(ctx context.Context, rawURL, cookie string) (int,
 	}
 	req.Header.Set("User-Agent", c.ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Cookie", cookie)
-	if c.clear != nil {
-		if h := c.clear.CookieHeader(); h != "" {
-			req.Header.Set("Cookie", cookie+"; "+h)
-		}
-	}
+	req.Header.Set("Cookie", cookie) // SSO only — no clearance jar on OAuth pages
+	req.Header.Set("Sec-Fetch-Site", "same-site")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Dest", "document")
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return 0, "", err
@@ -673,12 +673,14 @@ func (c *Client) setFormHeaders(req *http.Request, referer, cookie string) {
 	req.Header.Set("Origin", "https://accounts.x.ai")
 	req.Header.Set("Referer", referer)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// OAuth device verify/approve: ONLY session SSO. Do NOT append FlareSolverr/CF
+	// clearance cookies — they can poison auth.x.ai and yield invalid_grant Access denied.
 	req.Header.Set("Cookie", cookie)
-	if c.clear != nil {
-		if h := c.clear.CookieHeader(); h != "" {
-			req.Header.Set("Cookie", cookie+"; "+h)
-		}
-	}
+	req.Header.Set("Sec-Fetch-Site", "same-site")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
 }
 
 func (c *Client) PollToken(ctx context.Context, flow DeviceFlow) (Credential, error) {
@@ -724,11 +726,11 @@ func (c *Client) PollToken(ctx context.Context, flow DeviceFlow) (Credential, er
 		case "expired_token":
 			return Credential{}, fmt.Errorf("oauth_expired")
 		case "invalid_grant":
-			// Device not actually authorized — often false-positive ConfirmHTTP success.
+			// Device not actually authorized (confirm incomplete / denied / SSO mismatch).
 			if errDesc != "" {
-				return Credential{}, fmt.Errorf("oauth_rejected: invalid_grant (%s)", errDesc)
+				return Credential{}, fmt.Errorf("oauth_rejected: invalid_grant (%s) — device not authorized on auth.x.ai", errDesc)
 			}
-			return Credential{}, fmt.Errorf("oauth_rejected: invalid_grant")
+			return Credential{}, fmt.Errorf("oauth_rejected: invalid_grant — device not authorized on auth.x.ai")
 		default:
 			if errCode != "" {
 				if errDesc != "" {
@@ -818,6 +820,13 @@ func truncateBody(b []byte, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+func trimLoc(s string) string {
+	if len(s) <= 120 {
+		return s
+	}
+	return s[:120] + "…"
 }
 
 // Exchange is convenience: start flow + confirm HTTP + poll.
