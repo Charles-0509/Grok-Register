@@ -114,16 +114,38 @@ func (m *Manager) Prewarm() (string, error) {
 
 	for _, u := range urls {
 		start := time.Now()
-		cookies, userAgent, status, err := m.solveOne(client, u)
-		// One retry for critical hosts
-		if err != nil && isCriticalHost(u) {
+		var cookies []Cookie
+		var userAgent string
+		var status int
+		var err error
+		attempts := 1
+		if isCriticalHost(u) {
+			attempts = 4 // accounts/auth often fail on cold WARP
+		}
+		var lastErr error
+		for a := 0; a < attempts; a++ {
+			if a > 0 {
+				time.Sleep(time.Duration(2+a*2) * time.Second)
+			}
 			cookies, userAgent, status, err = m.solveOne(client, u)
+			if err == nil {
+				break
+			}
+			lastErr = err
+		}
+		if err != nil {
+			err = lastErr
 		}
 		elapsed := time.Since(start).Seconds()
 		h := hostOf(u)
 		if err != nil {
 			failN++
-			parts = append(parts, fmt.Sprintf("%s:ERR", h))
+			// Include short error so ops can see FS vs proxy vs CF
+			em := err.Error()
+			if len(em) > 60 {
+				em = em[:60] + "…"
+			}
+			parts = append(parts, fmt.Sprintf("%s:ERR(%s)", h, em))
 			continue
 		}
 		okN++

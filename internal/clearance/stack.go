@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -182,7 +183,13 @@ func EnsureStack(composeDir string, privoxyPort, flaresolverrPort int) (string, 
 	var last string
 	for time.Now().Before(deadline) {
 		if portOpen("127.0.0.1", privoxyPort) && httpOK(fmt.Sprintf("http://127.0.0.1:%d/", flaresolverrPort), 3*time.Second) {
-			return fmt.Sprintf("清障栈已就绪 dir=%s", dir), nil
+			// Ports up ≠ WARP tunnel ready. Wait until HTTP via privoxy works.
+			if proxyEgressOK(privoxyPort, 8*time.Second) {
+				return fmt.Sprintf("清障栈已就绪 dir=%s（端口+WARP 出口 OK）", dir), nil
+			}
+			last = "端口已开，等待 WARP 出口（via :40080）…"
+			time.Sleep(3 * time.Second)
+			continue
 		}
 		last = "等待 privoxy/flaresolverr 端口..."
 		time.Sleep(2 * time.Second)
@@ -192,6 +199,28 @@ func EnsureStack(composeDir string, privoxyPort, flaresolverrPort int) (string, 
 	}
 	// not fatal hard fail — prewarm may still work partially
 	return fmt.Sprintf("compose up 已执行 dir=%s，但健康检查超时: %s", dir, last), nil
+}
+
+// proxyEgressOK checks that Privoxy can fetch a trivial HTTPS URL (WARP path live).
+func proxyEgressOK(privoxyPort int, timeout time.Duration) bool {
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", privoxyPort)
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return false
+	}
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(u),
+		},
+	}
+	// cloudflare trace is light and works over WARP
+	resp, err := client.Get("https://www.cloudflare.com/cdn-cgi/trace")
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode > 0 && resp.StatusCode < 500
 }
 
 // StopStack stops clearance compose services (frees CPU/RAM; keeps volumes).

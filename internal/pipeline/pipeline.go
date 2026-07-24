@@ -223,11 +223,34 @@ func (e *Engine) run(ctx context.Context) error {
 		}
 		stackStarted = true
 		log.Infof("[clearance] %s", msg)
-		e.cm = clearance.NewManager(cfg.FlareSolverrURL, cfg.ClearanceProxy, cfg.ClearanceURLs)
-		if msg2, err2 := e.cm.Prewarm(); err2 != nil {
-			// Critical: accounts/auth ERR often correlates with OAuth invalid_grant later.
+		// Extra settle after cold start (WARP + FS browser pool).
+		if reason == "proxy_down" || reason == "proxy_refused" {
+			log.Info("[clearance] 冷启动后等待 8s 再预热…")
+			time.Sleep(8 * time.Second)
+		}
+		proxy := cfg.ClearanceProxy
+		if proxy == "" {
+			proxy = "http://privoxy:8118"
+		}
+		e.cm = clearance.NewManager(cfg.FlareSolverrURL, proxy, cfg.ClearanceURLs)
+		// Up to 2 full prewarm rounds if accounts still fails.
+		var msg2 string
+		var err2 error
+		for round := 1; round <= 2; round++ {
+			msg2, err2 = e.cm.Prewarm()
+			if err2 == nil {
+				break
+			}
+			if round < 2 && strings.Contains(err2.Error(), "accounts.x.ai") {
+				log.Warnf("[clearance] 预热第 %d 轮失败: %v — 15s 后重试", round, err2)
+				time.Sleep(15 * time.Second)
+				continue
+			}
+			break
+		}
+		if err2 != nil {
 			log.Warnf("[clearance] 预热异常: %v | %s", err2, msg2)
-			log.Warn("[clearance] 若 accounts.x.ai/auth.x.ai 为 ERR，OAuth 很可能全部 invalid_grant")
+			log.Warn("[clearance] 若 accounts.x.ai 为 ERR：请先 docker compose up 并保持栈常开(CLEARANCE_AUTO_STOP=0)，再 grok start")
 		} else {
 			log.Infof("[clearance] %s", msg2)
 		}
