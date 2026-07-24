@@ -456,6 +456,82 @@ sudo apt-get install -y xvfb
 - **推荐一键**：先装 Homebrew + Docker Desktop，再 `curl .../install.sh | bash`（见上文）  
 - 手动：`brew install go python`，venv + CloakBrowser，`make build && make install PREFIX=$HOME/.local`  
 - 清障：打开 Docker Desktop 后 `cd ~/Grok-Register/clearance && docker compose up -d`
+
+### Windows / Docker Desktop（推荐路径）
+
+> `grok` 二进制**不能在 Windows 原生编译**（`internal/daemon/daemon.go` 用 `syscall.Flock` / `Setsid` / `SIGTERM/SIGKILL`，Windows 没有 POSIX 信号）。
+> 用 Docker Desktop 跑容器镜像即可，所有 Unix 调用都在 linux/amd64 容器内执行，host 完全不参与。
+
+仓库根有现成的 `Dockerfile` + `docker-compose.yml`，整合了：
+
+- Go 编译的 `grok` 二进制
+- Python venv + Playwright + CloakBrowser Chromium
+- clearance 栈（WARP SOCKS5 + Privoxy HTTP + FlareSolverr）
+- grok 应用容器
+
+```powershell
+# 1) 起栈（首次构建镜像 + 拉取 3 个 clearance 镜像；耐心等几分钟）
+docker compose up -d --build
+docker compose ps
+# 期望：warp / privoxy / flaresolverr healthy，grok-reg Up
+
+# 2) 进入交互 — 与 Linux 完全一致
+docker exec -it grok-reg grok help
+docker exec -it grok-reg grok start -t 10
+docker exec -it grok-reg grok status
+docker exec -it grok-reg grok logs -f
+docker exec -it grok-reg grok stop
+```
+
+**输出文件**：宿主机可直接看到 `./data/`（Windows 资源管理器 `Grok-Register\data`）：
+- `data/config.env` — 首次启动从 `docker/grok-config.env` 拷过去；可手动改后 `docker compose restart grok`
+- `data/outputs/<run_id>/CPA/*.json` — 注册成功可直接拖入 CPA Management
+- `data/outputs/<run_id>/SSO/accounts.txt` — SSO 明细
+- `data/logs/run-*.log` — 完整日志
+
+**一次性前台跑一批（跑完即停、不残留）**：
+```powershell
+docker compose run --rm -e GROK_TARGET=20 grok run
+```
+
+**冒烟测试**（确认 CloakBrowser 在容器里能拿 token）：
+```powershell
+docker exec -it grok-reg sh
+# 容器内：
+/opt/cloakbrowser-venv/bin/python /usr/local/share/grok-reg/turnstile_mint.py \
+  --site-key 0x4AAAAAAAhr9JGVDZbrZOo0 \
+  --url https://accounts.x.ai/sign-up \
+  --proxy http://privoxy:8118 \
+  --timeout 70
+echo exit:$?
+```
+
+**关键约定**（与 Linux 裸跑差异）：
+| 项 | Linux 裸跑 | Docker Desktop Windows |
+|----|------------|-------------------------|
+| `REGISTER_PROXY` | `http://127.0.0.1:40080` | `http://privoxy:8118` |
+| `FLARESOLVERR_URL` | `http://127.0.0.1:8191` | `http://flaresolverr:8191` |
+| `CLEARANCE_PROXY` | `http://privoxy:8118` | `http://privoxy:8118` |
+| Chrome 路径 | `~/.cloakbrowser/...` | `/root/.cloakbrowser/...`（容器内 root） |
+| `GROK_HOME` | `~/.grok` | `/data`（=`host ./data`） |
+| `CPA_MANAGEMENT_BASE` | `http://127.0.0.1:8317/...` | `http://host.docker.internal:8317/...` |
+
+`docker/grok-config.env` 已写好上述约定，默认即用；如要改自覆写 `data/config.env`。
+
+**升级镜像**：
+```powershell
+git pull
+docker compose build grok
+docker compose up -d --force-recreate grok
+```
+
+**清理**（保留 ./data）：
+```powershell
+docker compose down           # 停容器
+docker compose down -v        # 同时删 network
+Remove-Item -Recurse bin/,, data/ -ErrorAction SilentlyContinue   # 连本地输出一起删
+```
+
 ---
 
 ## 命令一览

@@ -31,3 +31,9 @@ __pycache__/
 # Logs / runtime (should never be committed)
 *.log
 logs/
+
+# Docker local runtime (compose mounts ./data — container writes here)
+data/
+
+# OpenCode agent working directory
+.omo/
