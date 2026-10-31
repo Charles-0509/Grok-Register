@@ -7,7 +7,7 @@
 # Image runs as root (matches upstream turnstile_mint.py assumptions and
 # ~/.cloakbrowser install path). Don't enable rootless mode for this image.
 
-ARG GO_VERSION=1.26
+ARG GO_VERSION=1.26.10
 ARG PYTHON_VERSION=3.12
 ARG DEBIAN=bookworm
 
